@@ -41,8 +41,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t* evt) {
     return ESP_OK;
 }
 
-int kp_http_get(const char* url,
+static int do_request(esp_http_client_method_t method,
+    const char* url,
     const kp_http_header_t* headers, size_t header_count,
+    const char* body,
     char* buf, size_t buf_size,
     int* status_code) {
     if (!url || !buf || buf_size < 2 || !status_code) return -1;
@@ -54,18 +56,44 @@ int kp_http_get(const char* url,
     esp_http_client_handle_t client = kd_http_acquire(url, http_event_handler, &ctx, 20000);
     if (!client) return -1;
 
+    esp_http_client_set_method(client, method);
     for (size_t i = 0; i < header_count; i++) {
         if (headers[i].key && headers[i].value) {
             kd_http_set_header(headers[i].key, headers[i].value);
         }
     }
+    if (body) {
+        kd_http_set_header("Content-Type", "application/json");
+        esp_http_client_set_post_field(client, body, strlen(body));
+    }
 
     esp_err_t err = esp_http_client_perform(client);
     *status_code = esp_http_client_get_status_code(client);
+    // Undo request state so it can't leak into the next same-host acquire.
+    if (body) esp_http_client_set_post_field(client, NULL, 0);
+    esp_http_client_set_method(client, HTTP_METHOD_GET);
     if (err != ESP_OK) {
         kd_http_invalidate();  // connection state unknown, start fresh next time
     }
     kd_http_release();
 
     return (err == ESP_OK) ? 0 : -1;
+}
+
+int kp_http_get(const char* url,
+    const kp_http_header_t* headers, size_t header_count,
+    char* buf, size_t buf_size,
+    int* status_code) {
+    return do_request(HTTP_METHOD_GET, url, headers, header_count, NULL,
+        buf, buf_size, status_code);
+}
+
+int kp_http_post_json(const char* url,
+    const kp_http_header_t* headers, size_t header_count,
+    const char* body,
+    char* buf, size_t buf_size,
+    int* status_code) {
+    if (!body) return -1;
+    return do_request(HTTP_METHOD_POST, url, headers, header_count, body,
+        buf, buf_size, status_code);
 }

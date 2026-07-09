@@ -27,4 +27,5 @@ idf_component_register(
         esp_hw_support
         app_update
         mbedtls
+        nvs_flash
 )
