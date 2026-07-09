@@ -1,0 +1,20 @@
+menu "Koios SDK Configuration"
+
+    choice KOIOS_SDK_MALLOC_TARGET
+        prompt "Large buffer allocation target"
+        default KOIOS_SDK_MALLOC_SPIRAM if SPIRAM
+        default KOIOS_SDK_MALLOC_INTERNAL
+        help
+            Where message buffers (WebSocket rx/tx, tokens, certs) are
+            allocated. SPIRAM keeps internal RAM free for TLS handshakes.
+
+        config KOIOS_SDK_MALLOC_INTERNAL
+            bool "Internal RAM"
+
+        config KOIOS_SDK_MALLOC_SPIRAM
+            bool "SPIRAM"
+            depends on SPIRAM
+
+    endchoice
+
+endmenu
