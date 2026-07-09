@@ -29,7 +29,7 @@ identity, RTOS primitives.
 | `kp_http` | small buffered GET | kd_common's shared serialized HTTP client |
 | `kp_identity` | client cert + opaque key handle | kd_common crypto (DS peripheral) |
 | `kp_websocket` | complete-message WS client | esp_websocket_client + cert bundle |
-| `kp_ota` | download & flash an image | esp_https_ota |
+| `kp_ota` | download/verify/flash an image + pending-update record | esp_https_ota (streamed sha256) + NVS |
 
 The private key never crosses the port boundary: `kp_identity` hands out an
 opaque context (`esp_ds_data_ctx_t*` on ESP32) that `kp_websocket` feeds to
@@ -55,7 +55,7 @@ then:
 
 kd_common_init();
 
-koios_ota_init(NULL);  // defaults: firmware.api.koiosdigital.net, no variant
+koios_ota_init(NULL);  // defaults: https://ota.api.koios.sh (Koios OTA service)
 
 koios_cloudlink_config_t link = {
     .url = "wss://vn-sec.koios.sh",

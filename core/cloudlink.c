@@ -1,4 +1,5 @@
 #include "koios/cloudlink.h"
+#include "koios/ota.h"
 
 #include "koios/port/kp_os.h"
 #include "koios/port/kp_log.h"
@@ -276,6 +277,12 @@ static void handle_control_frame(const char* data, size_t len) {
     else if (strcmp(type, "twin.error") == 0) {
         const char* msg = cJSON_GetStringValue(cJSON_GetObjectItem(root, "message"));
         KP_LOGW(TAG, "twin.error: %s", msg ? msg : "?");
+    }
+    else if (strcmp(type, "ota.offer") == 0) {
+        // Low-latency nudge from a new deployment; the OTA module re-checks
+        // over HTTPS (no-op if koios_ota_init was never called).
+        KP_LOGI(TAG, "ota.offer received, triggering update check");
+        koios_ota_check_now();
     }
     else if (s.cfg.on_control) {
         s.cfg.on_control(data, len);

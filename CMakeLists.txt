@@ -26,5 +26,7 @@ idf_component_register(
         esp_https_ota
         esp_hw_support
         app_update
+        spi_flash
         mbedtls
+        nvs_flash
 )
