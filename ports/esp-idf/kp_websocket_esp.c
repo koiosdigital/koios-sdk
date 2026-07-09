@@ -116,6 +116,11 @@ kp_ws_t kp_ws_open(const kp_ws_config_t* cfg) {
     ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
     ws_cfg.network_timeout_ms = 15000;
     ws_cfg.buffer_size = 4096;
+    // Cloudlink dispatches app callbacks (on_message / control frames) on
+    // this task, so it needs app-work headroom on top of the TLS record
+    // path — esp_websocket_client's 4 KB default overflows as soon as a
+    // handler touches protobuf or NVS. Tunable per app via Kconfig.
+    ws_cfg.task_stack = CONFIG_KOIOS_SDK_WS_TASK_STACK;
     ws_cfg.ping_interval_sec = 25;
     ws_cfg.pingpong_timeout_sec = 60;
 

@@ -17,4 +17,14 @@ menu "Koios SDK Configuration"
 
     endchoice
 
+    config KOIOS_SDK_WS_TASK_STACK
+        int "WebSocket task stack size (bytes)"
+        default 10240
+        help
+            Stack for esp_websocket_client's task. Cloudlink dispatches the
+            app's on_message / control-frame callbacks on this task, so it
+            must cover the TLS record path PLUS whatever the app's handlers
+            do (protobuf unpack, NVS writes). Raise it if you see a stack
+            overflow in "websocket_task".
+
 endmenu
