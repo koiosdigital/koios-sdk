@@ -6,6 +6,7 @@
 #include "koios/port/kp_net.h"
 #include "koios/port/kp_identity.h"
 #include "koios/port/kp_websocket.h"
+#include "koios/port/kp_ota.h"
 
 #include <cJSON.h>
 #include <string.h>
@@ -213,6 +214,37 @@ static void store_token(const char* token, int64_t expires_at) {
 // Session / control frames
 //------------------------------------------------------------------------------
 
+// Report the running firmware's identity (and, when configured, the
+// hardware SKU) as a twin reported-state patch: fw.{project,version,class}.
+// The platform promotes fw.version for rollout bookkeeping and uses fw.class
+// to classify unclassified devices for OTA compatibility. Sent on every
+// session ready; the server dedups unchanged reports for free.
+static void report_fw_identity(void) {
+    char project[32] = { 0 };
+    char version[32] = { 0 };
+    kp_ota_get_app_desc(project, sizeof(project), version, sizeof(version));
+
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return;
+    cJSON_AddStringToObject(root, "type", "twin.report");
+    cJSON_AddStringToObject(root, "mode", "patch");
+    cJSON* state = cJSON_AddObjectToObject(root, "state");
+    cJSON* fw = state ? cJSON_AddObjectToObject(state, "fw") : NULL;
+    if (fw) {
+        if (project[0]) cJSON_AddStringToObject(fw, "project", project);
+        if (version[0]) cJSON_AddStringToObject(fw, "version", version);
+        if (s.cfg.device_class && s.cfg.device_class[0]) {
+            cJSON_AddStringToObject(fw, "class", s.cfg.device_class);
+        }
+        char* json = cJSON_PrintUnformatted(root);
+        if (json) {
+            locked_send(json, strlen(json), false);
+            cJSON_free(json);
+        }
+    }
+    cJSON_Delete(root);
+}
+
 static void on_session_ready(void) {
     if (s.session_ready) return;
     s.session_ready = true;
@@ -222,6 +254,7 @@ static void on_session_ready(void) {
     s.net_resets = 0;
     s.backoff_level = 0;
 
+    report_fw_identity();
     notify_state(KOIOS_CLOUD_STATE_READY);
     if (s.cfg.on_session_ready) s.cfg.on_session_ready();
     outbox_flush();

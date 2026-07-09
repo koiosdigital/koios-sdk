@@ -46,6 +46,15 @@ typedef struct {
     // copies it; the app may free its own buffer after init.
     const char* api_key;
 
+    // Hardware SKU of this build, reported to the cloud as twin reported
+    // state `fw.class` on every session ready, alongside the running
+    // firmware's project/version. Convention: <idf target>-<build variant>,
+    // e.g. "esp32s3-matrx_v9_64x32". The platform classifies the device with
+    // it (fill-when-unset) so OTA deployments only offer matching images.
+    // Optional; not copied — pass a string with static lifetime. Leave NULL
+    // for dev builds so a bench board never claims a production SKU.
+    const char* device_class;
+
     size_t max_msg_size;  // 0 -> 16 KiB. Inbound messages above this are dropped.
     size_t queue_depth;   // 0 -> 8. Outbox capacity in messages.
 
