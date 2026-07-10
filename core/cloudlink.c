@@ -224,6 +224,10 @@ static void report_fw_identity(void) {
     char version[32] = { 0 };
     kp_ota_get_app_desc(project, sizeof(project), version, sizeof(version));
 
+    // Class is the silicon target, sourced from the build (never app-supplied)
+    // so a device can only ever claim its real chip. Project is the IDF project
+    // name; variant is the app-configured build variant. Both become device
+    // labels the platform can target OTA deployments on.
     cJSON* root = cJSON_CreateObject();
     if (!root) return;
     cJSON_AddStringToObject(root, "type", "twin.report");
@@ -231,10 +235,11 @@ static void report_fw_identity(void) {
     cJSON* state = cJSON_AddObjectToObject(root, "state");
     cJSON* fw = state ? cJSON_AddObjectToObject(state, "fw") : NULL;
     if (fw) {
-        if (project[0]) cJSON_AddStringToObject(fw, "project", project);
+        cJSON_AddStringToObject(fw, "class", CONFIG_IDF_TARGET);
         if (version[0]) cJSON_AddStringToObject(fw, "version", version);
-        if (s.cfg.device_class && s.cfg.device_class[0]) {
-            cJSON_AddStringToObject(fw, "class", s.cfg.device_class);
+        if (project[0]) cJSON_AddStringToObject(fw, "project", project);
+        if (s.cfg.variant && s.cfg.variant[0]) {
+            cJSON_AddStringToObject(fw, "variant", s.cfg.variant);
         }
         char* json = cJSON_PrintUnformatted(root);
         if (json) {
