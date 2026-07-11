@@ -79,6 +79,11 @@ static struct {
     void* key_ctx;
 } s;
 
+// Control-task exit handshake. Lives outside `s` because init() memsets the
+// state struct; deinit() must positively observe the task's exit before any
+// of the resources the task uses (cert, key ctx, mutexes) are freed.
+static volatile bool s_ctl_task_exited;
+
 //------------------------------------------------------------------------------
 // Helpers
 //------------------------------------------------------------------------------
@@ -285,12 +290,21 @@ static void handle_control_frame(const char* data, size_t len) {
             const char* issued = cJSON_GetStringValue(cJSON_GetObjectItem(root, "api_key"));
             if (issued && issued[0]) {
                 // Server minted a device key (API-key autocreate). Adopt it
-                // for future attempts and let the app persist it.
+                // for future attempts and let the app persist it. The swap
+                // runs on the WS event task while start_client() (ctl task)
+                // reads s.api_key — guard both with token_mutex or a
+                // reconnect racing a welcome frame reads freed memory.
                 char* copy = kp_malloc(strlen(issued) + 1);
                 if (copy) {
                     strcpy(copy, issued);
-                    kp_free(s.api_key);
-                    s.api_key = copy;
+                    if (s.token_mutex && kp_mutex_take(s.token_mutex, 1000)) {
+                        kp_free(s.api_key);
+                        s.api_key = copy;
+                        kp_mutex_give(s.token_mutex);
+                    }
+                    else {
+                        kp_free(copy);
+                    }
                 }
                 if (s.cfg.on_api_key_issued) s.cfg.on_api_key_issued(issued);
             }
@@ -437,6 +451,7 @@ static int start_client(void) {
     cfg.on_event = ws_event;
     cfg.event_arg = NULL;
 
+    char* bearer_copy = NULL;
     if (s.cfg.auth_mode == KOIOS_CLOUD_AUTH_MTLS) {
         if (!s.cert_pem) {
             s.key_ctx = kp_identity_get_key_ctx();
@@ -454,10 +469,22 @@ static int start_client(void) {
         cfg.client_key_ctx = s.key_ctx;
     }
     else {
-        cfg.bearer = s.api_key;
+        // Snapshot the key under token_mutex: handle_control_frame (WS
+        // event task) can free/replace s.api_key while kp_ws_open reads it.
+        // kp_ws_open copies the bearer into its own header buffer, so the
+        // copy only needs to live across the call.
+        if (s.token_mutex && kp_mutex_take(s.token_mutex, 1000)) {
+            if (s.api_key) {
+                bearer_copy = kp_malloc(strlen(s.api_key) + 1);
+                if (bearer_copy) strcpy(bearer_copy, s.api_key);
+            }
+            kp_mutex_give(s.token_mutex);
+        }
+        cfg.bearer = bearer_copy;
     }
 
     kp_ws_t ws = kp_ws_open(&cfg);
+    kp_free(bearer_copy);
     if (!ws) return -1;
 
     if (!s.ws_mutex || !kp_mutex_take(s.ws_mutex, 6000)) {
@@ -474,7 +501,7 @@ static void ctl_task(void* arg) {
     (void)arg;
     for (;;) {
         if (!kp_sem_take(s.ctl_sem, KP_WAIT_FOREVER)) continue;
-        if (!s.initialized) return;
+        if (!s.initialized) break;
         destroy_ws();
         if (s.state == STATE_READY) {
             if (start_client() != 0) {
@@ -483,6 +510,7 @@ static void ctl_task(void* arg) {
             }
         }
     }
+    s_ctl_task_exited = true;  // deinit() waits on this
 }
 
 //------------------------------------------------------------------------------
@@ -576,6 +604,7 @@ void koios_cloudlink_init(const koios_cloudlink_config_t* config) {
     s.state = STATE_WAITING_NETWORK;
     s.initialized = true;
 
+    s_ctl_task_exited = false;
     if (!kp_task_spawn("cloudlink_ctl", ctl_task, NULL, 4096, 10)) {
         KP_LOGE(TAG, "Failed to spawn control task");
         s.initialized = false;
@@ -607,9 +636,26 @@ void koios_cloudlink_deinit(void) {
     }
     s.token_timer = s.welcome_timer = s.reconnect_timer = s.gate_timer = NULL;
 
-    // Wake the control task so it observes !initialized and exits.
+    // Wake the control task so it observes !initialized and exits, then
+    // JOIN it. A fixed sleep is not enough: the task can be seconds deep
+    // in a TLS handshake inside start_client(), still referencing
+    // s.cert_pem / s.key_ctx / s.ws_mutex — freeing those under it is a
+    // use-after-free, and re-init afterwards would spawn a second control
+    // task over the same state block.
     if (s.ctl_sem) kp_sem_give(s.ctl_sem);
-    kp_delay_ms(50);
+    int waited_ms = 0;
+    const int max_wait_ms = 30000;
+    while (!s_ctl_task_exited && waited_ms < max_wait_ms) {
+        kp_delay_ms(50);
+        waited_ms += 50;
+    }
+    if (!s_ctl_task_exited) {
+        // The task is stuck; tearing down the state it uses would corrupt
+        // the heap. Leak everything deliberately and refuse re-init until
+        // the task eventually exits (it will see !initialized).
+        KP_LOGE(TAG, "Control task did not exit after %dms - leaking cloudlink state", max_wait_ms);
+        return;
+    }
 
     destroy_ws();
     outbox_drain_free();
