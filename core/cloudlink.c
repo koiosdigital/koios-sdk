@@ -101,6 +101,12 @@ static volatile bool s_ctl_task_exited = true;
 static atomic_bool s_teardown;
 static atomic_int s_api_users;
 
+// Set when deinit() could not claim and destroy the WS client (ws_mutex
+// starved past all retries). The orphaned client's event task still runs
+// against the state block, so re-init (memset + fresh mutexes under it)
+// must be refused for the rest of the process lifetime.
+static atomic_bool s_ws_orphaned;
+
 static bool api_enter(void) {
     if (atomic_load(&s_teardown)) return false;
     atomic_fetch_add(&s_api_users, 1);
@@ -161,14 +167,22 @@ static bool locked_send(const void* data, size_t len, bool binary) {
     return ok;
 }
 
-static void destroy_ws(void) {
-    kp_ws_t victim = NULL;
-    if (s.ws_mutex && kp_mutex_take(s.ws_mutex, 6000)) {
-        victim = s.ws;
-        s.ws = NULL;
-        kp_mutex_give(s.ws_mutex);
+// Returns false if the client could not be claimed (ws_mutex starved) — the
+// old client is then still live and dispatching events. Callers MUST NOT
+// free state or open a second client over it in that case: an orphaned
+// client keeps running handle_control_frame/store_token against state a
+// later deinit frees (double free of s.token → SPIRAM heap corruption).
+static bool destroy_ws(void) {
+    if (!s.ws_mutex) return true;  // no mutex → no client was ever opened
+    if (!kp_mutex_take(s.ws_mutex, 6000)) {
+        KP_LOGE(TAG, "destroy_ws: ws_mutex held >6s, client NOT destroyed");
+        return false;
     }
+    kp_ws_t victim = s.ws;
+    s.ws = NULL;
+    kp_mutex_give(s.ws_mutex);
     if (victim) kp_ws_close(victim);
+    return true;
 }
 
 //------------------------------------------------------------------------------
@@ -481,7 +495,10 @@ static void ws_event(void* arg, kp_ws_event_type_t ev, const uint8_t* data, size
 static int start_client(void) {
     if (s.ws) {
         KP_LOGW(TAG, "Client already exists, destroying first");
-        destroy_ws();
+        // Never open a second client over a live one: the old client's
+        // event task would keep dispatching into shared state with no
+        // handle left to stop it.
+        if (!destroy_ws()) return -1;
     }
     s.disconnect_handled = false;
 
@@ -542,9 +559,9 @@ static void ctl_task(void* arg) {
     for (;;) {
         if (!kp_sem_take(s.ctl_sem, KP_WAIT_FOREVER)) continue;
         if (!s.initialized) break;
-        destroy_ws();
+        bool ws_gone = destroy_ws();
         if (s.state == STATE_READY) {
-            if (start_client() != 0) {
+            if (!ws_gone || start_client() != 0) {
                 s.backoff_level++;
                 schedule_reconnect();
             }
@@ -612,6 +629,10 @@ static void net_on_disconnect(void) {
 void koios_cloudlink_init(const koios_cloudlink_config_t* config) {
     if (s.initialized || !config || !config->url || !config->on_message) {
         KP_LOGE(TAG, "Invalid init");
+        return;
+    }
+    if (atomic_load(&s_ws_orphaned)) {
+        KP_LOGE(TAG, "Orphaned websocket client still live, refusing re-init");
         return;
     }
     if (!s_ctl_task_exited || atomic_load(&s_api_users) > 0) {
@@ -684,14 +705,11 @@ void koios_cloudlink_deinit(void) {
     if (!s.initialized) return;  // s_teardown stays set; init() reopens it
     s.initialized = false;
 
-    kp_timer_t timers[] = { s.token_timer, s.welcome_timer, s.reconnect_timer, s.gate_timer };
-    for (size_t i = 0; i < sizeof(timers) / sizeof(timers[0]); i++) {
-        if (timers[i]) {
-            kp_timer_stop(timers[i]);
-            kp_timer_delete(timers[i]);
-        }
-    }
-    s.token_timer = s.welcome_timer = s.reconnect_timer = s.gate_timer = NULL;
+    // NOTE teardown order: the WS event task (ws_event → handle_control_frame
+    // → store_token → kp_timer_stop/start) and the esp_timer callbacks touch
+    // timers and token state ungated — they are quiesced by ORDER, not by the
+    // api_enter() gate. Timers must therefore be deleted only after
+    // destroy_ws() has joined the WS task, and state freed only after both.
 
     // Wake the control task so it observes !initialized and exits, then
     // JOIN it. A fixed sleep is not enough: the task can be seconds deep
@@ -728,7 +746,36 @@ void koios_cloudlink_deinit(void) {
         return;
     }
 
-    destroy_ws();
+    // Claim and destroy the WS client BEFORE freeing anything. destroy_ws
+    // can be starved of ws_mutex by a sender mid-kp_ws_send (≤5s hold, in a
+    // loop from outbox_flush) — retry rather than proceed: freeing state
+    // under a live client is exactly the double-free-of-s.token → SPIRAM
+    // corruption this ordering exists to prevent.
+    bool ws_gone = false;
+    for (int attempt = 0; attempt < 5 && !ws_gone; attempt++) {
+        ws_gone = destroy_ws();
+    }
+    if (!ws_gone) {
+        // Orphaned live client: leak the entire state block deliberately
+        // and refuse re-init forever (the failure cascade will restart the
+        // device). Freeing anything here would corrupt the heap.
+        atomic_store(&s_ws_orphaned, true);
+        KP_LOGE(TAG, "WS client could not be destroyed - leaking cloudlink state");
+        return;
+    }
+
+    // WS task joined; nothing can restart timers now. Stop them, give any
+    // in-flight esp_timer callback a beat to drain, then delete.
+    kp_timer_t timers[] = { s.token_timer, s.welcome_timer, s.reconnect_timer, s.gate_timer };
+    for (size_t i = 0; i < sizeof(timers) / sizeof(timers[0]); i++) {
+        if (timers[i]) kp_timer_stop(timers[i]);
+    }
+    kp_delay_ms(20);
+    for (size_t i = 0; i < sizeof(timers) / sizeof(timers[0]); i++) {
+        if (timers[i]) kp_timer_delete(timers[i]);
+    }
+    s.token_timer = s.welcome_timer = s.reconnect_timer = s.gate_timer = NULL;
+
     outbox_drain_free();
 
     if (s.cert_pem) { kp_free(s.cert_pem); s.cert_pem = NULL; }
@@ -737,10 +784,10 @@ void koios_cloudlink_deinit(void) {
     if (s.token_mutex && kp_mutex_take(s.token_mutex, 1000)) {
         kp_free(s.token);
         s.token = NULL;
+        kp_free(s.api_key);
+        s.api_key = NULL;
         kp_mutex_give(s.token_mutex);
     }
-    kp_free(s.api_key);
-    s.api_key = NULL;
     kp_free(s.outbox);
     s.outbox = NULL;
 
