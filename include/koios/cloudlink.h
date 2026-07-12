@@ -106,6 +106,11 @@ bool koios_cloudlink_send_text(const char* text);
 // if none has been issued yet.
 char* koios_cloudlink_get_token_copy(void);
 
+// Copy the device UUID (assigned by the platform, delivered in the welcome
+// frame) into `out`. False if no session has been established yet. `out` is
+// always NUL-terminated; 48 bytes is enough for any UUID.
+bool koios_cloudlink_get_device_id(char* out, size_t out_size);
+
 // Ask the server for a fresh device JWT (rate-limited to one request per
 // 30 s). Call after a 401/403 on an HTTP API that consumes the token.
 void koios_cloudlink_request_token_refresh(void);

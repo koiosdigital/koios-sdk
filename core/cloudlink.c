@@ -74,6 +74,9 @@ static struct {
     int64_t token_expires_at;
     int64_t last_refresh_req_us;
 
+    // Device UUID from the welcome frame (guarded by token_mutex).
+    char device_id[48];
+
     // mTLS materials, fetched once and cached for the process lifetime.
     char* cert_pem;
     size_t cert_len;
@@ -318,6 +321,12 @@ static void handle_control_frame(const char* data, size_t len) {
         store_token(token, cJSON_IsNumber(exp) ? (int64_t)cJSON_GetNumberValue(exp) : 0);
 
         if (strcmp(type, "welcome") == 0) {
+            const char* dev_id = cJSON_GetStringValue(cJSON_GetObjectItem(root, "device_id"));
+            if (dev_id && dev_id[0] && s.token_mutex && kp_mutex_take(s.token_mutex, 1000)) {
+                snprintf(s.device_id, sizeof(s.device_id), "%s", dev_id);
+                kp_mutex_give(s.token_mutex);
+            }
+
             const char* issued = cJSON_GetStringValue(cJSON_GetObjectItem(root, "api_key"));
             if (issued && issued[0]) {
                 // Server minted a device key (API-key autocreate). Adopt it
@@ -803,6 +812,22 @@ char* koios_cloudlink_get_token_copy(void) {
     }
     api_exit();
     return copy;
+}
+
+bool koios_cloudlink_get_device_id(char* out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    if (!api_enter()) return false;
+    bool have_id = false;
+    if (s.token_mutex && kp_mutex_take(s.token_mutex, 1000)) {
+        if (s.device_id[0]) {
+            snprintf(out, out_size, "%s", s.device_id);
+            have_id = true;
+        }
+        kp_mutex_give(s.token_mutex);
+    }
+    api_exit();
+    return have_id;
 }
 
 void koios_cloudlink_request_token_refresh(void) {
