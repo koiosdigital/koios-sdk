@@ -9,6 +9,7 @@
 #include "koios/port/kp_ota.h"
 
 #include <cJSON.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -82,7 +83,37 @@ static struct {
 // Control-task exit handshake. Lives outside `s` because init() memsets the
 // state struct; deinit() must positively observe the task's exit before any
 // of the resources the task uses (cert, key ctx, mutexes) are freed.
-static volatile bool s_ctl_task_exited;
+// Starts true (no task yet) so the first init() is allowed; init() refuses to
+// run while false — a stuck control task still references the state block.
+static volatile bool s_ctl_task_exited = true;
+
+// Public-API teardown gate. deinit() can run at any time (e.g. the cert-renew
+// path reinitializes the link) while other tasks are inside send/is_ready —
+// those touch the outbox array and mutexes that deinit frees. A bare
+// `s.initialized` check is not enough: a sender that passed the check can
+// straddle the teardown, write into the freed outbox (use-after-free), and
+// then pop + kp_free garbage pointers — heap corruption. Entrants register in
+// s_api_users; deinit sets s_teardown first, then waits for users to drain
+// before freeing anything. Lives outside `s` for the same reason as above.
+static atomic_bool s_teardown;
+static atomic_int s_api_users;
+
+static bool api_enter(void) {
+    if (atomic_load(&s_teardown)) return false;
+    atomic_fetch_add(&s_api_users, 1);
+    // Re-check after registering: teardown may have started in between. The
+    // drain loop in deinit() only proceeds once we either back out here or
+    // finish the call, so past this point the state stays alive until exit.
+    if (atomic_load(&s_teardown) || !s.initialized) {
+        atomic_fetch_sub(&s_api_users, 1);
+        return false;
+    }
+    return true;
+}
+
+static void api_exit(void) {
+    atomic_fetch_sub(&s_api_users, 1);
+}
 
 //------------------------------------------------------------------------------
 // Helpers
@@ -574,6 +605,15 @@ void koios_cloudlink_init(const koios_cloudlink_config_t* config) {
         KP_LOGE(TAG, "Invalid init");
         return;
     }
+    if (!s_ctl_task_exited || atomic_load(&s_api_users) > 0) {
+        // A previous deinit() timed out with the control task or an API
+        // caller still inside the state block. memset'ing s under them (or
+        // spawning a second control task) would corrupt state. Once the
+        // stragglers exit, re-init becomes possible again. New API callers
+        // can't sneak in here: s_teardown stays set until init() succeeds.
+        KP_LOGE(TAG, "Previous cloudlink users still active, refusing re-init");
+        return;
+    }
 
     memset(&s, 0, sizeof(s));
     s.cfg = *config;
@@ -608,8 +648,12 @@ void koios_cloudlink_init(const koios_cloudlink_config_t* config) {
     if (!kp_task_spawn("cloudlink_ctl", ctl_task, NULL, 4096, 10)) {
         KP_LOGE(TAG, "Failed to spawn control task");
         s.initialized = false;
+        s_ctl_task_exited = true;  // nothing spawned; allow a retry
         return;
     }
+
+    // Everything senders touch is live; reopen the public API.
+    atomic_store(&s_teardown, false);
 
     kp_net_subscribe(net_on_connect, net_on_disconnect);
 
@@ -624,7 +668,11 @@ void koios_cloudlink_init(const koios_cloudlink_config_t* config) {
 }
 
 void koios_cloudlink_deinit(void) {
-    if (!s.initialized) return;
+    // Close the public API first: entrants now bounce off api_enter(). The
+    // exchange also makes concurrent deinit calls single-shot (the old
+    // check-then-clear of s.initialized let two callers both tear down).
+    if (atomic_exchange(&s_teardown, true)) return;
+    if (!s.initialized) return;  // s_teardown stays set; init() reopens it
     s.initialized = false;
 
     kp_timer_t timers[] = { s.token_timer, s.welcome_timer, s.reconnect_timer, s.gate_timer };
@@ -652,8 +700,22 @@ void koios_cloudlink_deinit(void) {
     if (!s_ctl_task_exited) {
         // The task is stuck; tearing down the state it uses would corrupt
         // the heap. Leak everything deliberately and refuse re-init until
-        // the task eventually exits (it will see !initialized).
+        // the task eventually exits (init checks s_ctl_task_exited).
         KP_LOGE(TAG, "Control task did not exit after %dms - leaking cloudlink state", max_wait_ms);
+        return;
+    }
+
+    // Drain in-flight public API calls (send/is_ready/... from the timer,
+    // job, and handler tasks). s_teardown is already set, so no new callers
+    // can enter; the ones inside are bounded by their mutex/send timeouts.
+    waited_ms = 0;
+    while (atomic_load(&s_api_users) > 0 && waited_ms < max_wait_ms) {
+        kp_delay_ms(10);
+        waited_ms += 10;
+    }
+    if (atomic_load(&s_api_users) > 0) {
+        // Freeing under a live caller is heap corruption; leak instead.
+        KP_LOGE(TAG, "API callers did not drain after %dms - leaking cloudlink state", max_wait_ms);
         return;
     }
 
@@ -680,48 +742,66 @@ void koios_cloudlink_deinit(void) {
 }
 
 bool koios_cloudlink_is_connected(void) {
-    return ws_connected_locked_check();
+    if (!api_enter()) return false;
+    bool connected = ws_connected_locked_check();
+    api_exit();
+    return connected;
 }
 
 bool koios_cloudlink_is_ready(void) {
-    return s.session_ready && ws_connected_locked_check();
+    if (!api_enter()) return false;
+    bool ready = s.session_ready && ws_connected_locked_check();
+    api_exit();
+    return ready;
 }
 
 bool koios_cloudlink_send(const void* data, size_t len) {
-    if (!s.initialized || !data || len == 0 || len > s.cfg.max_msg_size) return false;
+    if (!data || len == 0) return false;
+    if (!api_enter()) return false;
 
-    uint8_t* copy = kp_malloc(len);
-    if (!copy) {
-        KP_LOGE(TAG, "Failed to alloc %u bytes", (unsigned)len);
-        return false;
+    bool ok = false;
+    if (len <= s.cfg.max_msg_size) {
+        uint8_t* copy = kp_malloc(len);
+        if (!copy) {
+            KP_LOGE(TAG, "Failed to alloc %u bytes", (unsigned)len);
+        }
+        else {
+            memcpy(copy, data, len);
+            if (!outbox_push(copy, len)) {
+                KP_LOGW(TAG, "Outbox full");
+                kp_free(copy);
+            }
+            else {
+                outbox_flush();
+                ok = true;
+            }
+        }
     }
-    memcpy(copy, data, len);
 
-    if (!outbox_push(copy, len)) {
-        KP_LOGW(TAG, "Outbox full");
-        kp_free(copy);
-        return false;
-    }
-    outbox_flush();
-    return true;
+    api_exit();
+    return ok;
 }
 
 bool koios_cloudlink_send_text(const char* text) {
-    if (!s.initialized || !text) return false;
-    return locked_send(text, strlen(text), false);
+    if (!text) return false;
+    if (!api_enter()) return false;
+    bool ok = locked_send(text, strlen(text), false);
+    api_exit();
+    return ok;
 }
 
 char* koios_cloudlink_get_token_copy(void) {
-    if (!s.token_mutex) return NULL;
-    if (!kp_mutex_take(s.token_mutex, 1000)) return NULL;
-
+    if (!api_enter()) return NULL;
     char* copy = NULL;
-    if (s.token) {
-        size_t len = strlen(s.token) + 1;
-        copy = kp_malloc(len);
-        if (copy) memcpy(copy, s.token, len);
+    if (s.token_mutex && kp_mutex_take(s.token_mutex, 1000)) {
+        if (s.token) {
+            size_t len = strlen(s.token) + 1;
+            copy = kp_malloc(len);
+            if (copy) memcpy(copy, s.token, len);
+        }
+        kp_mutex_give(s.token_mutex);
     }
-    kp_mutex_give(s.token_mutex);
+    api_exit();
     return copy;
 }
 

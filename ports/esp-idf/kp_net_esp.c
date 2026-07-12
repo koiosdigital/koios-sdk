@@ -43,16 +43,22 @@ bool kp_net_is_connected(void) {
     return kd_common_is_wifi_connected();
 }
 
+// Re-subscribing an already-registered callback is a no-op: modules that
+// deinit/reinit at runtime (cloudlink on cert renewal) subscribe on every
+// init and would otherwise fill the table with duplicates.
+static void add_subscriber(kp_net_event_fn* list, size_t* count, kp_net_event_fn fn,
+                           const char* kind) {
+    for (size_t i = 0; i < *count; i++) {
+        if (list[i] == fn) return;
+    }
+    if (*count < MAX_SUBSCRIBERS) list[(*count)++] = fn;
+    else KP_LOGE(TAG, "Too many %s subscribers", kind);
+}
+
 void kp_net_subscribe(kp_net_event_fn on_connect, kp_net_event_fn on_disconnect) {
     ensure_registered();
-    if (on_connect) {
-        if (s.connect_count < MAX_SUBSCRIBERS) s.on_connect[s.connect_count++] = on_connect;
-        else KP_LOGE(TAG, "Too many connect subscribers");
-    }
-    if (on_disconnect) {
-        if (s.disconnect_count < MAX_SUBSCRIBERS) s.on_disconnect[s.disconnect_count++] = on_disconnect;
-        else KP_LOGE(TAG, "Too many disconnect subscribers");
-    }
+    if (on_connect) add_subscriber(s.on_connect, &s.connect_count, on_connect, "connect");
+    if (on_disconnect) add_subscriber(s.on_disconnect, &s.disconnect_count, on_disconnect, "disconnect");
 }
 
 void kp_net_reset(void) {
