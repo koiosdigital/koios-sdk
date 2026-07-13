@@ -1,4 +1,8 @@
 description: Koios device SDK — cloud WebSocket link and OTA update policy
 url: https://github.com/koiosdigital/koios-sdk
 dependencies:
-  espressif/esp_websocket_client: "^1.7.0"
+  # Koios fork of espressif/esp_websocket_client v1.7.0 with cross-task TLS
+  # teardown UAF fixes (sender-side abort deferral, destroy-from-own-task guard)
+  esp_websocket_client:
+    git: "https://github.com/koiosdigital/esp_websocket_client.git"
+    version: "v1.7.1"
