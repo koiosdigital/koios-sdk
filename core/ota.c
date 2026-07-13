@@ -23,9 +23,13 @@ static const char* TAG = "koios_ota";
 #define OTA_TASK_STACK_BYTES   12288
 #define OTA_TASK_PRIORITY      10
 #define MAX_BOOT_CHECK_RETRIES 3
+// Transient transport failures mid-download are retried in place before
+// falling back to the (12 h) periodic schedule.
+#define OTA_DOWNLOAD_ATTEMPTS  3
+#define OTA_DOWNLOAD_RETRY_MS  3000
 // Boot check waits out the post-IP rush (SNTP, TZ fetch, mDNS, WS mTLS
 // handshake) so its TLS handshake doesn't compete for internal RAM.
-#define BOOT_CHECK_DELAY_MS    30000
+#define BOOT_CHECK_DELAY_MS    15000
 
 #define URL_BUFFER_SIZE     256
 #define UPDATE_ID_SIZE      64
@@ -244,9 +248,6 @@ static void apply_offer(const char* token, ota_offer_t* offer) {
         offer->update_id);
     report_status(token, offer->update_id, "downloading", NULL);
 
-    // Persist before flashing so the post-reboot confirmation survives.
-    kp_ota_pending_save(offer->update_id, offer->version);
-
     char* auth = kp_malloc(strlen(token) + 8);
     if (auth) sprintf(auth, "Bearer %s", token);
 
@@ -256,7 +257,24 @@ static void apply_offer(const char* token, ota_offer_t* offer) {
         .sha256_hex = offer->sha256,
         .size = offer->size,
     };
-    int err = kp_ota_download_and_apply(&image);
+
+    // The transfer can drop mid-stream (transient TLS/transport errors, a CDN
+    // closing the connection). Retry a few times before giving up so a brief
+    // glitch doesn't push the whole update back to the 12 h schedule. Only
+    // transport failures are retried — a hash/size/flash failure is
+    // deterministic (wrong artifact or bad partition), so re-downloading just
+    // burns a flash cycle. esp_https_ota_begin re-erases app1 each attempt, so
+    // a retry restarts from a clean slate.
+    int err = KP_OTA_ERR_DOWNLOAD;
+    for (int attempt = 1; attempt <= OTA_DOWNLOAD_ATTEMPTS; attempt++) {
+        err = kp_ota_download_and_apply(&image);
+        if (err == KP_OTA_OK || err != KP_OTA_ERR_DOWNLOAD) break;
+        if (attempt < OTA_DOWNLOAD_ATTEMPTS) {
+            KP_LOGW(TAG, "Download attempt %d/%d failed, retrying in %d ms",
+                attempt, OTA_DOWNLOAD_ATTEMPTS, OTA_DOWNLOAD_RETRY_MS);
+            kp_delay_ms(OTA_DOWNLOAD_RETRY_MS);
+        }
+    }
     kp_free(auth);
 
     if (err != KP_OTA_OK) {
@@ -264,10 +282,14 @@ static void apply_offer(const char* token, ota_offer_t* offer) {
             : (err == KP_OTA_ERR_FLASH) ? "failed_flash"
             : "failed_download";
         KP_LOGE(TAG, "Update failed (%s)", code);
-        report_status(token, offer->update_id, "failed", code);
-        kp_ota_pending_clear();
+        //report_status(token, offer->update_id, "failed", code);
         return;
     }
+
+    // Only now is the new image committed as the next boot partition. Persist
+    // the expected version *after* the flash so a crash mid-download can't
+    // leave a stale marker that masquerades as a rollback on the next boot.
+    kp_ota_pending_save(offer->update_id, offer->version);
 
     report_status(token, offer->update_id, "rebooting", NULL);
     KP_LOGI(TAG, "Update applied, restarting...");
