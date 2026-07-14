@@ -18,7 +18,7 @@
 
 static const char* TAG = "kp_ota";
 
-#define OTA_BUFFER_SIZE 4096
+#define OTA_BUFFER_SIZE 6 * 1024
 
 #define NVS_NAMESPACE   "koios_ota"
 #define NVS_KEY_UPDATE  "pend_update"
