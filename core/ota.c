@@ -21,7 +21,7 @@ static const char* TAG = "koios_ota";
 // and fail parsing (treated as a check error, retried on schedule).
 #define RESPONSE_BUFFER_SIZE   4096
 #define OTA_TASK_STACK_BYTES   8192
-#define OTA_TASK_PRIORITY      10
+#define OTA_TASK_PRIORITY      4
 #define MAX_BOOT_CHECK_RETRIES 3
 // Transient transport failures mid-download are retried in place before
 // falling back to the (12 h) periodic schedule.
@@ -29,7 +29,7 @@ static const char* TAG = "koios_ota";
 #define OTA_DOWNLOAD_RETRY_MS  15000
 // Boot check waits out the post-IP rush (SNTP, TZ fetch, mDNS, WS mTLS
 // handshake) so its TLS handshake doesn't compete for internal RAM.
-#define BOOT_CHECK_DELAY_MS    30000
+#define BOOT_CHECK_DELAY_MS    15000
 
 #define URL_BUFFER_SIZE     256
 #define UPDATE_ID_SIZE      64
