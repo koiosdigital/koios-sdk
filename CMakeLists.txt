@@ -21,6 +21,8 @@ idf_component_register(
         cjson
         esp_event
         esp_wifi
+        esp_eth
+        esp_netif
         esp_timer
         esp_http_client
         esp_https_ota

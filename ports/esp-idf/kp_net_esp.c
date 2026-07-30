@@ -8,6 +8,8 @@
 
 #include <esp_event.h>
 #include <esp_wifi.h>
+#include <esp_eth.h>
+#include <esp_netif.h>
 
 #include <kd_common.h>
 
@@ -24,11 +26,17 @@ static struct {
 
 static void event_handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
     (void)arg; (void)data;
-    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+    if (base == IP_EVENT && (id == IP_EVENT_STA_GOT_IP || id == IP_EVENT_ETH_GOT_IP)) {
         for (size_t i = 0; i < s.connect_count; i++) s.on_connect[i]();
     }
-    else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        for (size_t i = 0; i < s.disconnect_count; i++) s.on_disconnect[i]();
+    else if ((base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) ||
+             (base == ETH_EVENT && id == ETHERNET_EVENT_DISCONNECTED)) {
+        // Ignore a single interface dropping while another still has an IP (e.g.
+        // WiFi being shut down when Ethernet takes over) — only tear the cloud
+        // link down once the device is fully offline.
+        if (!kd_common_is_network_connected()) {
+            for (size_t i = 0; i < s.disconnect_count; i++) s.on_disconnect[i]();
+        }
     }
 }
 
@@ -36,6 +44,11 @@ static void ensure_registered(void) {
     if (s.registered) return;
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, event_handler, NULL);
+    // Ethernet path (kd_common brings up W6100 when configured). Registering
+    // these unconditionally is harmless when Ethernet is absent — the events
+    // simply never fire.
+    esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, event_handler, NULL);
+    esp_event_handler_register(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, event_handler, NULL);
     s.registered = true;
 }
 
