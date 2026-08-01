@@ -8,7 +8,11 @@
 
 #include <esp_event.h>
 #include <esp_wifi.h>
+#if CONFIG_ETH_ENABLED
+// esp_eth is a config-only stub in IDF 6.1+ (no headers) unless Ethernet is
+// enabled in Kconfig; only pull it in — and reference ETH_EVENT below — then.
 #include <esp_eth.h>
+#endif
 #include <esp_netif.h>
 
 #include <kd_common.h>
@@ -29,8 +33,11 @@ static void event_handler(void* arg, esp_event_base_t base, int32_t id, void* da
     if (base == IP_EVENT && (id == IP_EVENT_STA_GOT_IP || id == IP_EVENT_ETH_GOT_IP)) {
         for (size_t i = 0; i < s.connect_count; i++) s.on_connect[i]();
     }
-    else if ((base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) ||
-             (base == ETH_EVENT && id == ETHERNET_EVENT_DISCONNECTED)) {
+    else if ((base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
+#if CONFIG_ETH_ENABLED
+             || (base == ETH_EVENT && id == ETHERNET_EVENT_DISCONNECTED)
+#endif
+    ) {
         // Ignore a single interface dropping while another still has an IP (e.g.
         // WiFi being shut down when Ethernet takes over) — only tear the cloud
         // link down once the device is fully offline.
@@ -48,7 +55,9 @@ static void ensure_registered(void) {
     // these unconditionally is harmless when Ethernet is absent — the events
     // simply never fire.
     esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, event_handler, NULL);
+#if CONFIG_ETH_ENABLED
     esp_event_handler_register(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, event_handler, NULL);
+#endif
     s.registered = true;
 }
 
