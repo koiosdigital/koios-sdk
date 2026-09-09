@@ -18,8 +18,12 @@ static const char* TAG = "cloudlink";
 #define DEFAULT_MAX_MSG_SIZE (16 * 1024)
 #define DEFAULT_QUEUE_DEPTH  8
 
-#define MAX_SOCK_FAILURES_BEFORE_NET_RESET 8
-#define MAX_NET_RESETS_BEFORE_RESTART      3
+// Escalation is deliberately slow: at the 60 s backoff cap, 30 consecutive
+// failures is ~30 min of cloud outage before the network is bounced, and six
+// bounces (~3 h) before a restart. A successful TCP/TLS connect resets the
+// failure count (see KP_WS_EV_CONNECTED) - it proves the local link works.
+#define MAX_SOCK_FAILURES_BEFORE_NET_RESET 30
+#define MAX_NET_RESETS_BEFORE_RESTART      6
 
 #define RECONNECT_BASE_DELAY_US (3000LL * 1000)
 #define RECONNECT_MAX_DELAY_US  (60LL * 1000 * 1000)
@@ -59,6 +63,7 @@ static struct {
     size_t out_head, out_count;
 
     kp_sem_t ctl_sem;  // wakes the control task to (re)connect
+    kp_sem_t tx_sem;   // wakes the sender task to drain the outbox
 
     kp_timer_t reconnect_timer;
     kp_timer_t gate_timer;
@@ -89,6 +94,8 @@ static struct {
 // Starts true (no task yet) so the first init() is allowed; init() refuses to
 // run while false — a stuck control task still references the state block.
 static volatile bool s_ctl_task_exited = true;
+// Same handshake for the sender task (see tx_task).
+static volatile bool s_tx_task_exited = true;
 
 // Public-API teardown gate. deinit() can run at any time (e.g. the cert-renew
 // path reinitializes the link) while other tasks are inside send/is_ready —
@@ -191,16 +198,24 @@ static bool destroy_ws(void) {
 
 static bool outbox_push(uint8_t* data, size_t len) {
     if (!kp_mutex_take(s.out_mutex, 100)) return false;
-    bool ok = false;
-    if (s.out_count < s.cfg.queue_depth) {
-        size_t idx = (s.out_head + s.out_count) % s.cfg.queue_depth;
-        s.outbox[idx].data = data;
-        s.outbox[idx].len = len;
-        s.out_count++;
-        ok = true;
+    if (s.out_count >= s.cfg.queue_depth) {
+        // Full: drop the OLDEST entry rather than the newest. The outbox only
+        // fills while the link is down, and what is queued then is stale
+        // telemetry; the newest message (typically the reconnect handshake)
+        // is the one worth keeping.
+        queued_msg_t* victim = &s.outbox[s.out_head];
+        KP_LOGW(TAG, "Outbox full, dropping oldest (%u bytes)", (unsigned)victim->len);
+        kp_free(victim->data);
+        victim->data = NULL;
+        s.out_head = (s.out_head + 1) % s.cfg.queue_depth;
+        s.out_count--;
     }
+    size_t idx = (s.out_head + s.out_count) % s.cfg.queue_depth;
+    s.outbox[idx].data = data;
+    s.outbox[idx].len = len;
+    s.out_count++;
     kp_mutex_give(s.out_mutex);
-    return ok;
+    return true;
 }
 
 static bool outbox_pop(queued_msg_t* out) {
@@ -214,6 +229,12 @@ static bool outbox_pop(queued_msg_t* out) {
     }
     kp_mutex_give(s.out_mutex);
     return ok;
+}
+
+// Wake the sender task. Safe from any task context (timer task, HTTP event
+// handlers): it never touches the socket itself.
+static void tx_wake(void) {
+    if (s.tx_sem) kp_sem_give(s.tx_sem);
 }
 
 static void outbox_flush(void) {
@@ -313,9 +334,12 @@ static void on_session_ready(void) {
     s.backoff_level = 0;
 
     report_fw_identity();
+    // Drain whatever queued while the link was down BEFORE the app's
+    // session-ready burst (license/purchases/claim) needs the slots.
+    outbox_flush();
     notify_state(KOIOS_CLOUD_STATE_READY);
     if (s.cfg.on_session_ready) s.cfg.on_session_ready();
-    outbox_flush();
+    tx_wake();
 }
 
 static void handle_control_frame(const char* data, size_t len) {
@@ -471,6 +495,9 @@ static void ws_event(void* arg, kp_ws_event_type_t ev, const uint8_t* data, size
     case KP_WS_EV_CONNECTED:
         s.state = STATE_CONNECTED;
         s.session_ready = false;
+        // The local link demonstrably works; only count failures that
+        // happen without ever reaching the server.
+        s.sock_failures = 0;
         if (s.welcome_timer) {
             kp_timer_stop(s.welcome_timer);
             kp_timer_start_once(s.welcome_timer, WELCOME_TIMEOUT_US);
@@ -487,7 +514,7 @@ static void ws_event(void* arg, kp_ws_event_type_t ev, const uint8_t* data, size
 
     case KP_WS_EV_MSG_BINARY:
         if (s.cfg.on_message) s.cfg.on_message(data, len);
-        outbox_flush();
+        tx_wake();
         break;
     }
 }
@@ -551,6 +578,21 @@ static int start_client(void) {
     s.ws = ws;
     kp_mutex_give(s.ws_mutex);
     return 0;
+}
+
+// Sender task: the ONLY place binary frames are written. koios_cloudlink_send
+// used to flush inline, which put a blocking mbedTLS record write (up to 11 s
+// with the mutex wait) on whatever task called it - the esp_timer task for
+// state broadcasts, HTTP event handlers for download progress. Now senders
+// just enqueue and wake this task.
+static void tx_task(void* arg) {
+    (void)arg;
+    for (;;) {
+        if (!kp_sem_take(s.tx_sem, KP_WAIT_FOREVER)) continue;
+        if (!s.initialized) break;
+        outbox_flush();
+    }
+    s_tx_task_exited = true;  // deinit() waits on this
 }
 
 // Control task: single place where clients are torn down and recreated.
@@ -635,7 +677,7 @@ void koios_cloudlink_init(const koios_cloudlink_config_t* config) {
         KP_LOGE(TAG, "Orphaned websocket client still live, refusing re-init");
         return;
     }
-    if (!s_ctl_task_exited || atomic_load(&s_api_users) > 0) {
+    if (!s_ctl_task_exited || !s_tx_task_exited || atomic_load(&s_api_users) > 0) {
         // A previous deinit() timed out with the control task or an API
         // caller still inside the state block. memset'ing s under them (or
         // spawning a second control task) would corrupt state. Once the
@@ -659,9 +701,10 @@ void koios_cloudlink_init(const koios_cloudlink_config_t* config) {
     s.out_mutex = kp_mutex_create();
     s.token_mutex = kp_mutex_create();
     s.ctl_sem = kp_sem_create();
+    s.tx_sem = kp_sem_create();
     s.outbox = kp_calloc(s.cfg.queue_depth, sizeof(queued_msg_t));
 
-    if (!s.ws_mutex || !s.out_mutex || !s.token_mutex || !s.ctl_sem || !s.outbox) {
+    if (!s.ws_mutex || !s.out_mutex || !s.token_mutex || !s.ctl_sem || !s.tx_sem || !s.outbox) {
         KP_LOGE(TAG, "Failed to allocate primitives");
         return;
     }
@@ -679,6 +722,15 @@ void koios_cloudlink_init(const koios_cloudlink_config_t* config) {
         KP_LOGE(TAG, "Failed to spawn control task");
         s.initialized = false;
         s_ctl_task_exited = true;  // nothing spawned; allow a retry
+        return;
+    }
+    // 6 KB: this task runs the TLS record write for every outbound frame.
+    s_tx_task_exited = false;
+    if (!kp_task_spawn("cloudlink_tx", tx_task, NULL, 6144, 9)) {
+        KP_LOGE(TAG, "Failed to spawn sender task");
+        s.initialized = false;
+        s_tx_task_exited = true;
+        if (s.ctl_sem) kp_sem_give(s.ctl_sem);  // let the control task exit
         return;
     }
 
@@ -718,13 +770,14 @@ void koios_cloudlink_deinit(void) {
     // use-after-free, and re-init afterwards would spawn a second control
     // task over the same state block.
     if (s.ctl_sem) kp_sem_give(s.ctl_sem);
+    if (s.tx_sem) kp_sem_give(s.tx_sem);
     int waited_ms = 0;
     const int max_wait_ms = 30000;
-    while (!s_ctl_task_exited && waited_ms < max_wait_ms) {
+    while ((!s_ctl_task_exited || !s_tx_task_exited) && waited_ms < max_wait_ms) {
         kp_delay_ms(50);
         waited_ms += 50;
     }
-    if (!s_ctl_task_exited) {
+    if (!s_ctl_task_exited || !s_tx_task_exited) {
         // The task is stuck; tearing down the state it uses would corrupt
         // the heap. Leak everything deliberately and refuse re-init until
         // the task eventually exits (init checks s_ctl_task_exited).
@@ -792,6 +845,7 @@ void koios_cloudlink_deinit(void) {
     s.outbox = NULL;
 
     if (s.ctl_sem) { kp_sem_delete(s.ctl_sem); s.ctl_sem = NULL; }
+    if (s.tx_sem) { kp_sem_delete(s.tx_sem); s.tx_sem = NULL; }
     if (s.token_mutex) { kp_mutex_delete(s.token_mutex); s.token_mutex = NULL; }
     if (s.out_mutex) { kp_mutex_delete(s.out_mutex); s.out_mutex = NULL; }
     if (s.ws_mutex) { kp_mutex_delete(s.ws_mutex); s.ws_mutex = NULL; }
@@ -824,11 +878,10 @@ bool koios_cloudlink_send(const void* data, size_t len) {
         else {
             memcpy(copy, data, len);
             if (!outbox_push(copy, len)) {
-                KP_LOGW(TAG, "Outbox full");
-                kp_free(copy);
+                kp_free(copy);  // out_mutex starved; caller may retry
             }
             else {
-                outbox_flush();
+                tx_wake();
                 ok = true;
             }
         }
