@@ -5,7 +5,7 @@
 // Owns the connection lifecycle end to end: waits for network (and identity,
 // for mTLS), connects, expects a `welcome` control frame, manages the device
 // JWT it carries, reconnects with jittered exponential backoff, and escalates
-// persistent failures (socket -> network reset -> device restart).
+// persistent LINK failures (socket -> network reset -> device restart).
 //
 // Two auth modes, matching the vn worker:
 //   KOIOS_CLOUD_AUTH_MTLS    wss://vn-sec.koios.sh — client cert via
@@ -17,7 +17,23 @@
 //
 // Text frames are the control channel (welcome/token/twin.*), handled here.
 // Binary frames are the app's protocol; they arrive via on_message and are
-// sent with koios_cloudlink_send().
+// sent with koios_cloudlink_send(). Both text and binary outbound frames go
+// through one FIFO outbox drained by cloudlink's sender task.
+//
+// Escalation. Only failures where nothing answered (DNS, TCP connect, socket
+// or pong timeouts) count towards the network-reset / restart cascade. A
+// server that answers — an HTTP status on the upgrade, a TLS alert, a
+// certificate rejection, a close frame — proves the local link works and
+// never escalates. Restarts are counted in reboot-persistent storage
+// (kp_persist): after 3 cloudlink restarts without an intervening session,
+// cloudlink stops restarting and just keeps backing off. The app can veto
+// any escalation step with koios_cloudlink_set_restart_policy().
+//
+// Callback context. on_message, on_control, on_session_ready, on_disconnect,
+// on_api_key_issued and on_timezone run on the WebSocket transport task. They
+// MUST NOT block: the socket is not serviced while they run, and a teardown
+// (reconnect, deinit) waits at most ~20 s for them before detaching the
+// client. Hand real work to another task.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -54,23 +70,29 @@ typedef struct {
     // Optional; not copied — pass a string with static lifetime.
     const char* variant;
 
-    size_t max_msg_size;  // 0 -> 16 KiB. Inbound messages above this are dropped.
-    size_t queue_depth;   // 0 -> 8. Outbox capacity in messages.
+    // Maximum message size in bytes; 0 -> 16 KiB. Bounds both inbound
+    // messages (the port drops larger ones) and what koios_cloudlink_send /
+    // send_text accept. The outbox holds up to queue_depth messages of up to
+    // this size, so its worst-case footprint is queue_depth x max_msg_size
+    // (logged at init). Apps that raise this (e.g. 32 KiB for pattern chunks)
+    // pay for it in SPIRAM only while messages are actually queued.
+    size_t max_msg_size;
+    size_t queue_depth;   // 0 -> 8. Outbox capacity in messages (text + binary).
 
     // Coarse connection state for UI. Optional.
     void (*on_state_change)(koios_cloud_state_t state);
 
     // Session established / lost. on_disconnect fires only if the session
-    // had been ready. Optional.
+    // had been ready. Optional. Run on the WebSocket task; must not block.
     void (*on_session_ready)(void);
     void (*on_disconnect)(void);
 
-    // Complete inbound binary message. Runs in cloudlink's context; the
-    // buffer is freed after return. Required.
+    // Complete inbound binary message. Runs on the WebSocket task; the
+    // buffer is freed after return. Required. Must not block.
     void (*on_message)(const uint8_t* data, size_t len);
 
     // Unhandled text control frame (anything beyond welcome/token/twin.*),
-    // for app-level extensions. Optional.
+    // for app-level extensions. Optional. Must not block.
     void (*on_control)(const char* json, size_t len);
 
     // API-key mode: server minted a device key for this device (sent once,
@@ -89,17 +111,33 @@ typedef struct {
 void koios_cloudlink_init(const koios_cloudlink_config_t* config);
 void koios_cloudlink_deinit(void);
 
+// Restart / network-reset policy. When set, cloudlink calls may_restart(ctx)
+// before every escalation step it would otherwise take on its own — the
+// network bounce (kp_net_reset) after repeated link failures and the device
+// restart after repeated bounces. Returning false vetoes that step: cloudlink
+// logs once, skips it, and keeps reconnecting with backoff (it asks again at
+// the next escalation point). Typical use: refuse to restart while an OTA
+// download or a drawing job is in progress. May be called before or after
+// init; the policy persists across deinit/init. Runs on cloudlink's control
+// task and must not block. Pass NULL to clear.
+void koios_cloudlink_set_restart_policy(bool (*may_restart)(void* ctx), void* ctx);
+
 // True while the socket is up (welcome may still be pending).
 bool koios_cloudlink_is_connected(void);
 
 // True once the session is established (welcome received, not yet dropped).
 bool koios_cloudlink_is_ready(void);
 
-// Queue one binary message. The data is copied. False if the outbox is full
-// or cloudlink is not initialized; queued messages survive a reconnect.
+// Queue one binary message. The data is copied. False if the outbox cannot
+// accept it (mutex starved, message over max_msg_size) or cloudlink is not
+// initialized. Queued messages survive a reconnect: the sender task sends the
+// head of the queue and only removes it once the write succeeded. When the
+// outbox is full the OLDEST queued message is dropped to make room.
 bool koios_cloudlink_send(const void* data, size_t len);
 
-// Send a text control frame immediately (no queueing). False if offline.
+// Queue one text control frame (NUL-terminated JSON; copied). Same outbox
+// and ordering guarantees as koios_cloudlink_send. False if it cannot be
+// queued or cloudlink is not initialized.
 bool koios_cloudlink_send_text(const char* text);
 
 // Copy of the current device JWT, kp_malloc'd (free with kp_free), or NULL
@@ -112,7 +150,8 @@ char* koios_cloudlink_get_token_copy(void);
 bool koios_cloudlink_get_device_id(char* out, size_t out_size);
 
 // Ask the server for a fresh device JWT (rate-limited to one request per
-// 30 s). Call after a 401/403 on an HTTP API that consumes the token.
+// 30 s). Call after a 401/403 on an HTTP API that consumes the token. The
+// request is queued like any other frame; safe from timer callbacks.
 void koios_cloudlink_request_token_refresh(void);
 
 #ifdef __cplusplus

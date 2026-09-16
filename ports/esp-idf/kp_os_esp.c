@@ -6,6 +6,7 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
+#include <esp_attr.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <esp_random.h>
@@ -165,4 +166,56 @@ void kp_delay_ms(uint32_t ms) {
 
 void kp_system_restart(void) {
     esp_restart();
+}
+
+//------------------------------------------------------------------------------
+// Reboot-persistent slots — RTC RAM, survives esp_restart() but not power-on.
+// RTC noinit memory holds garbage after a power cycle, so the block is
+// validated by magic + checksum and zeroed when it does not check out.
+//------------------------------------------------------------------------------
+
+#define PERSIST_MAGIC 0x4B505253u  // "KPRS"
+
+typedef struct {
+    uint32_t magic;
+    uint32_t slots[KP_PERSIST_SLOTS];
+    uint32_t check;
+} persist_block_t;
+
+static RTC_NOINIT_ATTR persist_block_t s_persist;
+static portMUX_TYPE s_persist_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint32_t persist_checksum(const persist_block_t* b) {
+    uint32_t h = 2166136261u ^ b->magic;
+    for (unsigned i = 0; i < KP_PERSIST_SLOTS; i++) {
+        h = (h ^ b->slots[i]) * 16777619u;
+    }
+    return h;
+}
+
+// Caller holds s_persist_mux.
+static void persist_validate_locked(void) {
+    if (s_persist.magic != PERSIST_MAGIC || s_persist.check != persist_checksum(&s_persist)) {
+        memset(&s_persist, 0, sizeof(s_persist));
+        s_persist.magic = PERSIST_MAGIC;
+        s_persist.check = persist_checksum(&s_persist);
+    }
+}
+
+uint32_t kp_persist_get(unsigned slot) {
+    if (slot >= KP_PERSIST_SLOTS) return 0;
+    portENTER_CRITICAL(&s_persist_mux);
+    persist_validate_locked();
+    uint32_t v = s_persist.slots[slot];
+    portEXIT_CRITICAL(&s_persist_mux);
+    return v;
+}
+
+void kp_persist_set(unsigned slot, uint32_t value) {
+    if (slot >= KP_PERSIST_SLOTS) return;
+    portENTER_CRITICAL(&s_persist_mux);
+    persist_validate_locked();
+    s_persist.slots[slot] = value;
+    s_persist.check = persist_checksum(&s_persist);
+    portEXIT_CRITICAL(&s_persist_mux);
 }

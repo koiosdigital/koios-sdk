@@ -27,17 +27,23 @@ static const char* TAG = "koios_ota";
 // falling back to the (12 h) periodic schedule.
 #define OTA_DOWNLOAD_ATTEMPTS  3
 #define OTA_DOWNLOAD_RETRY_MS  15000
-// Boot check waits out the post-IP rush (SNTP, TZ fetch, mDNS, WS mTLS
-// handshake) so its TLS handshake doesn't compete for internal RAM.
-#define BOOT_CHECK_DELAY_MS    15000
+// The boot check is armed by cloudlink's session-ready event (the check
+// needs the device JWT that session carries). A short settle lets the
+// post-connect burst (twin reports, app handshake) clear before another TLS
+// handshake competes for internal RAM; a failed attempt is retried on a
+// timer rather than waiting for the next network event.
+#define BOOT_CHECK_DELAY_US    (10LL * 1000 * 1000)
+#define BOOT_CHECK_RETRY_US    (60LL * 1000 * 1000)
 
 #define URL_BUFFER_SIZE     256
 #define UPDATE_ID_SIZE      64
 #define VERSION_SIZE        64
 
 static struct {
+    bool initialized;
     koios_ota_config_t cfg;
     kp_timer_t periodic_timer;
+    kp_timer_t boot_timer;  // one-shot: initial delay and retries of the boot check
 
     // Guarded by check_mutex: at most one check task at a time.
     kp_mutex_t check_mutex;
@@ -282,7 +288,9 @@ static void apply_offer(const char* token, ota_offer_t* offer) {
             : (err == KP_OTA_ERR_FLASH) ? "failed_flash"
             : "failed_download";
         KP_LOGE(TAG, "Update failed (%s)", code);
-        //report_status(token, offer->update_id, "failed", code);
+        // Tell the server so the rollout dashboard sees the failure instead
+        // of a device stuck in "downloading".
+        report_status(token, offer->update_id, "failed", code);
         return;
     }
 
@@ -336,7 +344,7 @@ static bool perform_update_check(void) {
 }
 
 //------------------------------------------------------------------------------
-// Scheduling (unchanged policy: delayed boot check w/ retries, 12 h periodic)
+// Scheduling: boot check armed by session-ready (+ timed retries), then 12 h
 //------------------------------------------------------------------------------
 
 static void start_periodic_timer(void) {
@@ -348,10 +356,6 @@ static void start_periodic_timer(void) {
 
 static void ota_check_task(void* arg) {
     bool is_boot_check = arg != NULL;
-
-    if (is_boot_check) {
-        kp_delay_ms(BOOT_CHECK_DELAY_MS);
-    }
 
     bool success = perform_update_check();
 
@@ -371,8 +375,13 @@ static void ota_check_task(void* arg) {
                 start_periodic_timer();
             }
             else {
-                KP_LOGW(TAG, "Boot check failed (attempt %d/%d), will retry",
-                    s.boot_check_retries, MAX_BOOT_CHECK_RETRIES);
+                KP_LOGW(TAG, "Boot check failed (attempt %d/%d), retrying in %llds",
+                    s.boot_check_retries, MAX_BOOT_CHECK_RETRIES,
+                    (long long)(BOOT_CHECK_RETRY_US / 1000000));
+                if (s.boot_timer) {
+                    kp_timer_stop(s.boot_timer);
+                    kp_timer_start_once(s.boot_timer, BOOT_CHECK_RETRY_US);
+                }
             }
         }
     }
@@ -410,33 +419,55 @@ static void periodic_timer_cb(void* arg) {
     }
 }
 
-static void ota_on_net_connect(void) {
-    if (s.boot_check_pending) {
-        KP_LOGI(TAG, "Network up, starting boot check");
-        spawn_check_task(true);
+static void boot_timer_cb(void* arg) {
+    (void)arg;
+    if (!s.boot_check_pending) return;
+    if (!kp_net_is_connected()) {
+        // Network went away again; session-ready re-arms us when it is back.
+        KP_LOGD(TAG, "Boot check deferred: offline");
+        return;
     }
+    spawn_check_task(true);
+}
+
+static void arm_boot_check(int64_t delay_us) {
+    if (!s.boot_timer || !s.boot_check_pending) return;
+    kp_timer_stop(s.boot_timer);
+    kp_timer_start_once(s.boot_timer, delay_us);
 }
 
 void koios_ota_init(const koios_ota_config_t* config) {
+    if (s.initialized) return;
     if (config) s.cfg = *config;
     if (!s.cfg.endpoint_url) s.cfg.endpoint_url = DEFAULT_ENDPOINT_URL;
 
     s.check_mutex = kp_mutex_create();
     s.periodic_timer = kp_timer_create("ota_periodic", periodic_timer_cb, NULL);
-    if (!s.check_mutex || !s.periodic_timer) {
+    s.boot_timer = kp_timer_create("ota_boot", boot_timer_cb, NULL);
+    if (!s.check_mutex || !s.periodic_timer || !s.boot_timer) {
         KP_LOGE(TAG, "Failed to allocate primitives");
+        if (s.periodic_timer) { kp_timer_delete(s.periodic_timer); s.periodic_timer = NULL; }
+        if (s.boot_timer) { kp_timer_delete(s.boot_timer); s.boot_timer = NULL; }
+        if (s.check_mutex) { kp_mutex_delete(s.check_mutex); s.check_mutex = NULL; }
         return;
     }
+    s.initialized = true;
 
-    kp_net_subscribe(ota_on_net_connect, NULL);
-
-    // Net may already be up (init after connect) — kp_net_subscribe fires no
-    // synthetic events, so kick the boot check ourselves.
-    if (kp_net_is_connected() && s.boot_check_pending) {
-        spawn_check_task(true);
+    // The session may already be up (init after connect) — cloudlink fires no
+    // synthetic session-ready, so arm the boot check ourselves.
+    if (koios_cloudlink_is_ready()) {
+        KP_LOGI(TAG, "Cloud session already ready, arming boot check");
+        arm_boot_check(BOOT_CHECK_DELAY_US);
     }
 
     KP_LOGI(TAG, "Initialized (endpoint: %s)", s.cfg.endpoint_url);
+}
+
+void koios_ota_on_session_ready(void) {
+    if (!s.initialized || !s.boot_check_pending) return;
+    KP_LOGI(TAG, "Cloud session ready, boot check in %llds",
+        (long long)(BOOT_CHECK_DELAY_US / 1000000));
+    arm_boot_check(BOOT_CHECK_DELAY_US);
 }
 
 bool koios_ota_boot_check_completed(void) {
@@ -444,6 +475,7 @@ bool koios_ota_boot_check_completed(void) {
 }
 
 void koios_ota_check_now(void) {
+    if (!s.initialized) return;
     if (kp_net_is_connected()) {
         spawn_check_task(false);
     }

@@ -54,6 +54,16 @@ uint32_t kp_random(void);
 void     kp_delay_ms(uint32_t ms);
 void     kp_system_restart(void);
 
+// Reboot-surviving scratch words, used by the core to bound restart loops
+// (restart count, escalation counters). Backed by memory that survives a
+// software restart but not a power cycle (RTC RAM on ESP32). Slots read as 0
+// after a power-on or when the backing memory is found corrupt. A port
+// without such memory may back them with plain RAM — they then reset on
+// every boot, which is the safe direction. Callable from any task.
+#define KP_PERSIST_SLOTS 4
+uint32_t kp_persist_get(unsigned slot);
+void     kp_persist_set(unsigned slot, uint32_t value);
+
 #ifdef __cplusplus
 }
 #endif

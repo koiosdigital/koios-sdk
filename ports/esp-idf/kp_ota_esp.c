@@ -13,12 +13,15 @@
 
 #include <kd_http.h>
 
+#include <ctype.h>
 #include <string.h>
 #include <stdio.h>
 
 static const char* TAG = "kp_ota";
 
 #define OTA_BUFFER_SIZE 6 * 1024
+#define OTA_URL_MAX     512
+#define OTA_HOST_MAX    128
 
 #define NVS_NAMESPACE   "koios_ota"
 #define NVS_KEY_UPDATE  "pend_update"
@@ -28,22 +31,85 @@ static const char* TAG = "kp_ota";
 // Download + flash
 //------------------------------------------------------------------------------
 
-// The image sha256 is computed over the response body as esp_https_ota
+// The image sha256 is computed over the FINAL response body as esp_https_ota
 // streams it (HTTP_EVENT_ON_DATA fires before the OTA layer consumes each
 // chunk) and compared against the manifest BEFORE esp_https_ota_finish()
-// commits the new boot partition.
+// commits the new boot partition. esp_https_ota follows redirects itself and
+// drains each redirect's body through the same client, so the digest and
+// byte count are restarted on every request (HTTP_EVENT_HEADERS_SENT) and
+// only 2xx bodies are hashed.
 typedef struct {
     psa_hash_operation_t sha;
     size_t received;
+    bool hash_ready;            // psa_hash_setup succeeded for the current response
+    char origin_host[OTA_HOST_MAX];  // host of the artifact URL; the bearer is for it only
 } download_ctx_t;
 
 static download_ctx_t s_dl;
 static const char* s_bearer;  // valid for the duration of one download
 
+// Copy the host part of `url` into `host` (lowercased, without port).
+static void url_host(const char* url, char* host, size_t host_size) {
+    host[0] = '\0';
+    if (!url) return;
+    const char* p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    // Skip userinfo if present (user:pass@host)
+    const char* at = strchr(p, '@');
+    const char* slash = strchr(p, '/');
+    if (at && (!slash || at < slash)) p = at + 1;
+    size_t n = 0;
+    while (p[n] && p[n] != '/' && p[n] != ':' && p[n] != '?' && p[n] != '#') n++;
+    if (n >= host_size) n = host_size - 1;
+    for (size_t i = 0; i < n; i++) host[i] = (char)tolower((unsigned char)p[i]);
+    host[n] = '\0';
+}
+
+static bool hash_restart(void) {
+    // No-op when the operation is already finished/aborted or still INIT.
+    psa_hash_abort(&s_dl.sha);
+    s_dl.sha = (psa_hash_operation_t)PSA_HASH_OPERATION_INIT;
+    s_dl.received = 0;
+    s_dl.hash_ready = (psa_hash_setup(&s_dl.sha, PSA_ALG_SHA_256) == PSA_SUCCESS);
+    if (!s_dl.hash_ready) KP_LOGE(TAG, "psa_hash_setup failed");
+    return s_dl.hash_ready;
+}
+
 static esp_err_t ota_http_event_handler(esp_http_client_event_t* evt) {
-    if (evt && evt->event_id == HTTP_EVENT_ON_DATA && evt->data && evt->data_len > 0) {
-        psa_hash_update(&s_dl.sha, evt->data, evt->data_len);
-        s_dl.received += evt->data_len;
+    if (!evt) return ESP_OK;
+    switch (evt->event_id) {
+    case HTTP_EVENT_ON_CONNECTED: {
+        // Fires before the request is written — including the reconnect a
+        // cross-host redirect (artifact CDN) triggers. The bearer
+        // authenticates us to the OTA service only; never hand it to
+        // another host.
+        char url[OTA_URL_MAX];
+        if (esp_http_client_get_url(evt->client, url, sizeof(url)) == ESP_OK) {
+            char host[OTA_HOST_MAX];
+            url_host(url, host, sizeof(host));
+            if (s_dl.origin_host[0] && strcmp(host, s_dl.origin_host) != 0) {
+                KP_LOGI(TAG, "Redirected to %s: dropping Authorization header", host);
+                esp_http_client_delete_header(evt->client, "Authorization");
+            }
+        }
+        break;
+    }
+    case HTTP_EVENT_HEADERS_SENT:
+        // A new response is about to arrive (initial request or a redirect
+        // hop). Only the last one carries the image.
+        hash_restart();
+        break;
+    case HTTP_EVENT_ON_DATA:
+        if (evt->data && evt->data_len > 0 && s_dl.hash_ready) {
+            const int status = esp_http_client_get_status_code(evt->client);
+            if (status >= 200 && status < 300) {
+                psa_hash_update(&s_dl.sha, evt->data, evt->data_len);
+                s_dl.received += evt->data_len;
+            }
+        }
+        break;
+    default:
+        break;
     }
     return ESP_OK;
 }
@@ -56,9 +122,14 @@ static esp_err_t ota_http_client_init_cb(esp_http_client_handle_t client) {
 }
 
 static bool sha256_matches(const char* expected_hex) {
+    if (!s_dl.hash_ready) {
+        KP_LOGE(TAG, "No digest available for the image body");
+        return false;
+    }
     uint8_t digest[PSA_HASH_LENGTH(PSA_ALG_SHA_256)];
     size_t digest_len = 0;
     psa_status_t status = psa_hash_finish(&s_dl.sha, digest, sizeof(digest), &digest_len);
+    s_dl.hash_ready = false;
     if (status != PSA_SUCCESS || digest_len != sizeof(digest)) {
         KP_LOGE(TAG, "psa_hash_finish failed: %d", (int)status);
         return false;
@@ -86,17 +157,18 @@ int kp_ota_download_and_apply(const kp_ota_image_t* image) {
         return KP_OTA_ERR_DOWNLOAD;
     }
 
-    psa_status_t psa_status = psa_crypto_init();
-    if (psa_status == PSA_SUCCESS) {
-        s_dl.sha = (psa_hash_operation_t)PSA_HASH_OPERATION_INIT;
-        psa_status = psa_hash_setup(&s_dl.sha, PSA_ALG_SHA_256);
-    }
-    if (psa_status != PSA_SUCCESS) {
-        KP_LOGE(TAG, "PSA hash setup failed: %d", (int)psa_status);
+    if (psa_crypto_init() != PSA_SUCCESS) {
+        KP_LOGE(TAG, "psa_crypto_init failed");
         kd_http_unlock();
         return KP_OTA_ERR_DOWNLOAD;
     }
-    s_dl.received = 0;
+    s_dl.sha = (psa_hash_operation_t)PSA_HASH_OPERATION_INIT;
+    s_dl.hash_ready = false;
+    if (!hash_restart()) {
+        kd_http_unlock();
+        return KP_OTA_ERR_DOWNLOAD;
+    }
+    url_host(image->url, s_dl.origin_host, sizeof(s_dl.origin_host));
     s_bearer = image->bearer;
 
     esp_http_client_config_t http_config = {
@@ -159,8 +231,10 @@ int kp_ota_download_and_apply(const kp_ota_image_t* image) {
 
 out:
     s_bearer = NULL;
+    s_dl.origin_host[0] = '\0';
     // No-op if psa_hash_finish already terminated the operation.
     psa_hash_abort(&s_dl.sha);
+    s_dl.hash_ready = false;
     kd_http_unlock();
     return result;
 }
