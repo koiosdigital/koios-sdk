@@ -52,6 +52,12 @@ static const char* TAG = "cloudlink";
 // link flapped); store_token() re-arms the proper deadline on arrival.
 #define TOKEN_REFRESH_RETRY_US        (60LL * 1000 * 1000)
 
+// Text "ping" keepalive. Cloudflare DO hibernation auto-responds to TEXT
+// "ping" with "pong" without waking the DO; protocol-level pings (opcode
+// 0x9) are handled at the edge and don't count as DO activity, so the DO
+// idles out after ~100 s. This timer sends a TEXT frame to keep it alive.
+#define PING_INTERVAL_US              (30LL * 1000 * 1000)
+
 // How long a teardown waits for the WS task before the port detaches it.
 // Above the port's 15 s connect timeout so a legitimate in-flight handshake
 // finishes; a blocked app callback is the only thing that trips it.
@@ -103,6 +109,7 @@ static struct {
     bool escalate_requested;  // ctl task should run the failure cascade
     bool veto_logged;         // "policy vetoed" logged once per streak
     bool cap_logged;          // "restart cap reached" logged once per streak
+    bool cert_refresh_requested; // cert renewed: clear cache and reconnect
 
     kp_mutex_t ws_mutex;  // guards ws handle lifetime
     kp_ws_t ws;
@@ -122,6 +129,7 @@ static struct {
     kp_timer_t gate_timer;
     kp_timer_t welcome_timer;
     kp_timer_t token_timer;
+    kp_timer_t ping_timer;
 
     kp_mutex_t token_mutex;
     char* token;
@@ -514,6 +522,7 @@ static void on_session_ready(void) {
     state_unlock();
 
     if (s.welcome_timer) kp_timer_stop(s.welcome_timer);
+    if (s.ping_timer) kp_timer_start_periodic(s.ping_timer, PING_INTERVAL_US);
     kp_persist_set(PERSIST_SLOT_NET_RESETS, 0);
     kp_persist_set(PERSIST_SLOT_RESTARTS, 0);
 
@@ -528,9 +537,23 @@ static void on_session_ready(void) {
 }
 
 static void handle_control_frame(const char* data, size_t len) {
+    if (!data || len == 0) {
+        KP_LOGW(TAG, "Empty control frame");
+        return;
+    }
+
+    if (len == 4 && strncmp(data, "pong", 4) == 0) {
+        return;
+    }
+
     cJSON* root = cJSON_ParseWithLength(data, len);
     if (!root) {
         KP_LOGW(TAG, "Unparseable control frame (%u bytes)", (unsigned)len);
+        for (size_t i = 0; i < len; i++) {
+            KP_LOGW(TAG, " %02X", (unsigned char)data[i]);
+        }
+        KP_LOGW(TAG, "End of unparseable control frame");
+        cJSON_Delete(root);
         return;
     }
 
@@ -599,6 +622,53 @@ static void handle_control_frame(const char* data, size_t len) {
         KP_LOGI(TAG, "ota.offer received, triggering update check");
         koios_ota_check_now();
     }
+    else if (strcmp(type, "cert.renew_required") == 0) {
+        if (s.cfg.auth_mode != KOIOS_CLOUD_AUTH_MTLS || !s.cfg.on_cert_renew_csr) {
+            KP_LOGW(TAG, "cert.renew_required ignored (no handler or not mTLS)");
+        }
+        else {
+            KP_LOGI(TAG, "Server requested certificate renewal");
+            char* csr = s.cfg.on_cert_renew_csr();
+            if (csr) {
+                cJSON* req = cJSON_CreateObject();
+                if (req) {
+                    cJSON_AddStringToObject(req, "type", "cert.renew_request");
+                    cJSON_AddStringToObject(req, "csr", csr);
+                    char* json = cJSON_PrintUnformatted(req);
+                    if (json) {
+                        enqueue_text(json);
+                        cJSON_free(json);
+                        KP_LOGI(TAG, "Cert renewal CSR sent to server");
+                    }
+                    cJSON_Delete(req);
+                }
+                kp_free(csr);
+            }
+        }
+    }
+    else if (strcmp(type, "cert.renew_response") == 0) {
+        cJSON* ok = cJSON_GetObjectItem(root, "success");
+        if (!cJSON_IsTrue(ok)) {
+            const char* err = cJSON_GetStringValue(cJSON_GetObjectItem(root, "error"));
+            KP_LOGE(TAG, "Cert renewal rejected: %s", err ? err : "unknown");
+        }
+        else {
+            const char* cert = cJSON_GetStringValue(cJSON_GetObjectItem(root, "cert_pem"));
+            const char* chain = cJSON_GetStringValue(cJSON_GetObjectItem(root, "chain_pem"));
+            if (!cert) {
+                KP_LOGE(TAG, "cert.renew_response missing cert_pem");
+            }
+            else if (s.cfg.on_cert_renewed) {
+                s.cfg.on_cert_renewed(cert, chain);
+                KP_LOGI(TAG, "Certificate renewed; reconnecting with fresh material");
+                if (state_lock()) {
+                    s.cert_refresh_requested = true;
+                    state_unlock();
+                }
+                if (s.ctl_sem) kp_sem_give(s.ctl_sem);
+            }
+        }
+    }
     else if (s.cfg.on_control) {
         s.cfg.on_control(data, len);
     }
@@ -639,6 +709,7 @@ static void try_advance_state(void) {
 // from the transport task.
 static void handle_ws_disconnect(const kp_ws_disconnect_info_t* info) {
     if (s.welcome_timer) kp_timer_stop(s.welcome_timer);
+    if (s.ping_timer) kp_timer_stop(s.ping_timer);
 
     if (!state_lock()) return;
     if (s.state == STATE_WAITING_NETWORK || s.disconnect_handled) {
@@ -901,6 +972,30 @@ static void ctl_task(void* arg) {
         }
 
         if (escalate) run_escalation();
+
+        // Cert renewal: the WS task stored a new cert via the app callback
+        // and asked us to reconnect with it. Clear the cached PEM so
+        // start_client() re-fetches it from kp_identity, then tear down
+        // the live session and reconnect immediately.
+        bool cert_refresh = false;
+        if (state_lock()) {
+            cert_refresh = s.cert_refresh_requested;
+            if (cert_refresh) s.cert_refresh_requested = false;
+            state_unlock();
+        }
+        if (cert_refresh) {
+            kp_free(s.cert_pem);
+            s.cert_pem = NULL;
+            KP_LOGI(TAG, "Cert cache cleared for renewal; tearing down for reconnect");
+            destroy_ws();
+            if (state_lock()) {
+                s.backoff_level = 0;
+                state_unlock();
+            }
+            schedule_reconnect();
+            continue;
+        }
+
         if (!connect) continue;
 
         const destroy_result_t gone = destroy_ws();
@@ -976,6 +1071,11 @@ static void token_timer_cb(void* arg) {
     if (s.token_timer) kp_timer_start_once(s.token_timer, TOKEN_REFRESH_RETRY_US);
 }
 
+static void ping_timer_cb(void* arg) {
+    (void)arg;
+    enqueue_text("ping");
+}
+
 static void net_on_connect(void) {
     bool start_gate = false;
     if (state_lock()) {
@@ -1004,6 +1104,7 @@ static void net_on_disconnect(void) {
     }
     if (!changed) return;
     if (s.welcome_timer) kp_timer_stop(s.welcome_timer);
+    if (s.ping_timer) kp_timer_stop(s.ping_timer);
     // The socket's own DISCONNECTED is ignored in WAITING_NETWORK, so the
     // session-lost notification has to come from here.
     if (was_ready && s.cfg.on_disconnect) s.cfg.on_disconnect();
@@ -1017,11 +1118,11 @@ static void net_on_disconnect(void) {
 // Release everything init() allocates. Only valid once no task or callback
 // can still touch `s` (tasks joined, WS client destroyed, timers stopped).
 static void free_primitives(void) {
-    kp_timer_t timers[] = { s.token_timer, s.welcome_timer, s.reconnect_timer, s.gate_timer };
+    kp_timer_t timers[] = { s.token_timer, s.welcome_timer, s.reconnect_timer, s.gate_timer, s.ping_timer };
     for (size_t i = 0; i < sizeof(timers) / sizeof(timers[0]); i++) {
         if (timers[i]) kp_timer_delete(timers[i]);
     }
-    s.token_timer = s.welcome_timer = s.reconnect_timer = s.gate_timer = NULL;
+    s.token_timer = s.welcome_timer = s.reconnect_timer = s.gate_timer = s.ping_timer = NULL;
 
     if (s.cert_pem) { kp_free(s.cert_pem); s.cert_pem = NULL; }
     if (s.key_ctx) { kp_identity_release_key_ctx(s.key_ctx); s.key_ctx = NULL; }
@@ -1085,10 +1186,12 @@ void koios_cloudlink_init(const koios_cloudlink_config_t* config) {
     s.gate_timer = kp_timer_create("cl_gate", gate_timer_cb, NULL);
     s.welcome_timer = kp_timer_create("cl_welcome", welcome_timeout_cb, NULL);
     s.token_timer = kp_timer_create("cl_token", token_timer_cb, NULL);
+    s.ping_timer = kp_timer_create("cl_ping", ping_timer_cb, NULL);
 
     if (!s.state_mutex || !s.ws_mutex || !s.out_mutex || !s.token_mutex ||
         !s.ctl_sem || !s.tx_sem || !s.outbox ||
-        !s.reconnect_timer || !s.gate_timer || !s.welcome_timer || !s.token_timer) {
+        !s.reconnect_timer || !s.gate_timer || !s.welcome_timer || !s.token_timer ||
+        !s.ping_timer) {
         KP_LOGE(TAG, "Failed to allocate primitives");
         free_primitives();
         return;
@@ -1222,7 +1325,7 @@ void koios_cloudlink_deinit(void) {
 
     // WS task joined; nothing can restart timers now. Stop them, give any
     // in-flight esp_timer callback a beat to drain, then delete.
-    kp_timer_t timers[] = { s.token_timer, s.welcome_timer, s.reconnect_timer, s.gate_timer };
+    kp_timer_t timers[] = { s.token_timer, s.welcome_timer, s.reconnect_timer, s.gate_timer, s.ping_timer };
     for (size_t i = 0; i < sizeof(timers) / sizeof(timers[0]); i++) {
         if (timers[i]) kp_timer_stop(timers[i]);
     }

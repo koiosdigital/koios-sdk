@@ -106,6 +106,16 @@ typedef struct {
     // Extra readiness gate polled before connecting (1 Hz). Optional; mTLS
     // mode already gates on kp_identity_ready().
     bool (*ready_gate)(void);
+
+    // Cert renewal (mTLS only). When the server sends cert.renew_required,
+    // cloudlink calls on_cert_renew_csr; the app regenerates its CSR and
+    // returns a kp_malloc'd NUL-terminated PEM (cloudlink frees it), or
+    // NULL to decline. On success the server replies with the signed cert;
+    // on_cert_renewed is called with the PEM cert and chain. After storing
+    // the cert, cloudlink clears its cached TLS material and reconnects.
+    // Both run on the WebSocket task; must not block.
+    char* (*on_cert_renew_csr)(void);
+    void (*on_cert_renewed)(const char* cert_pem, const char* chain_pem);
 } koios_cloudlink_config_t;
 
 void koios_cloudlink_init(const koios_cloudlink_config_t* config);
