@@ -44,7 +44,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t* evt) {
 static int do_request(esp_http_client_method_t method,
     const char* url,
     const kp_http_header_t* headers, size_t header_count,
-    const char* body, const char* content_type,
+    const char* body,
     char* buf, size_t buf_size,
     int* status_code) {
     if (!url || !buf || buf_size < 2 || !status_code) return -1;
@@ -63,7 +63,7 @@ static int do_request(esp_http_client_method_t method,
         }
     }
     if (body) {
-        kd_http_set_header("Content-Type", content_type ? content_type : "application/json");
+        kd_http_set_header("Content-Type", "application/json");
         esp_http_client_set_post_field(client, body, strlen(body));
     }
 
@@ -84,18 +84,8 @@ int kp_http_get(const char* url,
     const kp_http_header_t* headers, size_t header_count,
     char* buf, size_t buf_size,
     int* status_code) {
-    return do_request(HTTP_METHOD_GET, url, headers, header_count, NULL, NULL,
+    return do_request(HTTP_METHOD_GET, url, headers, header_count, NULL,
         buf, buf_size, status_code);
-}
-
-int kp_http_post(const char* url,
-    const kp_http_header_t* headers, size_t header_count,
-    const char* body, const char* content_type,
-    char* buf, size_t buf_size,
-    int* status_code) {
-    if (!body) return -1;
-    return do_request(HTTP_METHOD_POST, url, headers, header_count, body,
-        content_type, buf, buf_size, status_code);
 }
 
 int kp_http_post_json(const char* url,
@@ -105,5 +95,5 @@ int kp_http_post_json(const char* url,
     int* status_code) {
     if (!body) return -1;
     return do_request(HTTP_METHOD_POST, url, headers, header_count, body,
-        "application/json", buf, buf_size, status_code);
+        buf, buf_size, status_code);
 }

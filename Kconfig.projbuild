@@ -28,16 +28,16 @@ menu "Koios SDK Configuration"
             overflow in "websocket_task".
 
     config KOIOS_SDK_LOGS_ENABLE
-        bool "Ship device logs to Koios (POST /v1/logs)"
+        bool "Ship device logs to Koios (over the cloudlink websocket)"
         default n
         help
             Capture every ESP_LOGx line, buffer it in RTC-retained memory so
-            it survives resets/brownouts/deep sleep, and stream batches as
-            NDJSON to the Koios gateway using the cloudlink device token.
-            Off by default; the device's fleet must also grant the
-            `logs.write` capability (fleet default_caps) or the gateway
-            answers 403. When disabled, no capture hook, task, or
-            RTC footprint is added.
+            it survives resets/brownouts/deep sleep, and stream batches to the
+            Koios gateway as a {"type":"logs",...} control frame over the
+            existing cloudlink websocket. The frame rides the already-
+            authenticated device session, so there is no bearer token and no
+            `logs.write` capability to grant. Off by default; when disabled,
+            no capture hook, task, or RTC footprint is added.
 
     if KOIOS_SDK_LOGS_ENABLE
 
@@ -73,11 +73,11 @@ menu "Koios SDK Configuration"
                 when the network comes up.
 
         config KOIOS_SDK_LOGS_BODY_BYTES
-            int "Max NDJSON batch body (bytes)"
+            int "Max log frame body (bytes)"
             default 16384
             help
-                Upper bound on a single POST body; larger backlogs ship across
-                several batches. Allocated once from the SDK buffer pool.
+                Upper bound on a single log control frame; larger backlogs ship
+                across several frames. Allocated once from the SDK buffer pool.
 
     endif
 

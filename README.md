@@ -81,26 +81,28 @@ untouched.
 captures every `ESP_LOGx` line — level, tag, message, and a wall-clock
 timestamp — into a ring buffer in **RTC-retained memory**, so the lines written
 just before a reset, brownout, or deep sleep survive it. A background task
-drains the ring and streams batches as **NDJSON** to `POST /v1/logs` on the
-gateway (`https://vn.koios.sh/v1/logs` by default), authenticated with the same
-cloudlink device JWT OTA uses — the JWT ingest path is host-agnostic, so mTLS
-devices stay on the plain `vn` ingress too. It flushes on a timer, on an
-error-level line, on a near-full buffer, and when the network comes up (to push
-the reset-survived tail out before the backend's acceptance window closes).
-Lines captured before the clock syncs ship without a timestamp and the gateway
-stamps them at receive time.
+drains the ring and streams batches to the gateway as a text control frame over
+the **existing cloudlink websocket**:
+
+```json
+{"type":"logs","logs":[{"level":"info","tag":"wifi","message":"...","ts":1699999999000}, ...]}
+```
+
+Because the frame rides the already-authenticated device session, the gateway
+stamps the connection's `device_id`/`fleet_id`/`tenant_id` onto every line — so
+there is **no separate log host, no bearer token, and no `logs.write`
+capability** to provision per fleet. This works the same for mTLS and API-key
+devices (the socket is the device's one authenticated channel). It flushes on a
+timer, on an error-level line, on a near-full buffer, and on network-up; while a
+backlog waits it polls the session readiness so the reset-survived tail ships
+promptly once the link is up. Lines captured before the clock syncs ship without
+a timestamp and the gateway stamps them at receive time.
 
 The feature is **opt-in and off by default**, gated by
 `CONFIG_KOIOS_SDK_LOGS_ENABLE` (mirroring how the app opts into OTA). When
 disabled, `koios_logship_init()` is a no-op and the component adds no capture
 hook, task, or RTC footprint. Buffer sizing (ring capacity, tag/message caps),
-flush cadence, and max batch body are Kconfig options.
-
-> **Capability:** the device JWT must carry `logs.write`. That capability is in
-> `DEVICE_CAPS` but **not** in `DEFAULT_DEVICE_CAPS`, so a fleet only hands it to
-> its devices if its `default_caps` includes `logs.write`. Without it the
-> gateway answers `403` and the ship task logs a warning and backs off until the
-> next flush.
+flush cadence, and max frame body are Kconfig options.
 
 Crash scope: RTC survival of the pre-reboot log tail is what this provides.
 Coredump capture (`esp_core_dump`) is a possible later add and is out of scope.

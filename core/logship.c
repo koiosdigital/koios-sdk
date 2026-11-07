@@ -1,10 +1,15 @@
 // Log shipping policy (portable).
 //
-// Drains the reset-surviving log store (kp_logstore) and streams batches as
-// NDJSON to the Koios gateway's POST /v1/logs, authenticated with the cloudlink
-// device JWT — the same token OTA uses. Mechanism (capture, retained storage,
-// HTTP, RTOS) lives behind the kp_* ports; this file owns only policy: when to
-// flush, how to batch, how to serialize, and how to react to the gateway.
+// Drains the reset-surviving log store (kp_logstore) and streams batches to the
+// Koios gateway as a `{"type":"logs","logs":[...]}` text control frame over the
+// existing cloudlink websocket. The frame rides the already-authenticated
+// device session, so there is no separate HTTP host, no bearer token, and no
+// `logs.write` capability to provision — the gateway stamps the connection's
+// device/fleet/tenant identity onto every line.
+//
+// Mechanism (capture, retained storage, RTOS, the socket itself) lives behind
+// the kp_* ports and cloudlink; this file owns only policy: when to flush, how
+// to batch, how to serialize, and how to react to a full outbox.
 //
 // The whole module is compiled out unless CONFIG_KOIOS_SDK_LOGS_ENABLE is set,
 // mirroring how OTA is an opt-in the app wires in. koios_logship_init() is
@@ -20,15 +25,12 @@
 #include "koios/port/kp_logstore.h"
 #include "koios/port/kp_os.h"
 #include "koios/port/kp_net.h"
-#include "koios/port/kp_http.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
 static const char* TAG = "koios_logship";
-
-#define DEFAULT_INGEST_URL "https://vn.koios.sh/v1/logs"
 
 #ifdef CONFIG_KOIOS_SDK_LOGS_FLUSH_INTERVAL_MS
 #define DEFAULT_FLUSH_INTERVAL_MS CONFIG_KOIOS_SDK_LOGS_FLUSH_INTERVAL_MS
@@ -42,19 +44,24 @@ static const char* TAG = "koios_logship";
 #define BODY_CAP 16384
 #endif
 
-// Covers the TLS POST path plus the NDJSON assembly scratch on the frame.
-#define SHIP_TASK_STACK_BYTES 10240
+// Building JSON + enqueuing a frame is light (no TLS on this task — cloudlink's
+// sender does the socket write), so a small stack is enough.
+#define SHIP_TASK_STACK_BYTES 4096
 #define SHIP_TASK_PRIORITY    4
-// Small: the gateway only returns {data:{accepted,rejected}}.
-#define RESPONSE_BUFFER_SIZE  192
+// While logs are waiting but the session is not up yet, re-check readiness on
+// this short cadence instead of the full flush interval, so the reset-survived
+// tail ships promptly once the link comes up.
+#define READY_POLL_MS         3000
+
+static const char* FRAME_PREFIX = "{\"type\":\"logs\",\"logs\":[";
+static const char* FRAME_SUFFIX = "]}";
 
 static struct {
-    koios_logship_config_t cfg;
     uint32_t flush_interval_ms;
     kp_sem_t wake;
     koios_log_entry_t* batch;   // peek scratch, capacity entries
     size_t batch_cap;
-    char* body;                 // NDJSON assembly buffer, BODY_CAP bytes
+    char* body;                 // frame assembly buffer, BODY_CAP + 1 bytes
     bool running;
 } s;
 
@@ -92,8 +99,8 @@ static char* json_escape(char* dst, size_t dst_cap, const char* src) {
     return dst;
 }
 
-// Render one record as a JSON object (no trailing newline) into out. Returns
-// the length, or 0 if it would not fit.
+// Render one record as a JSON object (no trailing comma) into out. Returns the
+// length, or 0 if it would not fit.
 static size_t render_record(char* out, size_t out_cap, uint8_t level,
     const char* tag, const char* message, int64_t ts_ms) {
     char etag[KOIOS_LOG_TAG_LEN * 2 + 2];
@@ -116,38 +123,59 @@ static size_t render_record(char* out, size_t out_cap, uint8_t level,
 }
 
 //------------------------------------------------------------------------------
-// Ship
+// Frame assembly + ship
 //------------------------------------------------------------------------------
 
-typedef enum { POST_OK, POST_AUTH, POST_FAIL } post_result_t;
+// Build {"type":"logs","logs":[...]} into s.body for as many of the n entries
+// as fit, plus an optional leading overflow-gap marker. Returns the number of
+// entries packed; *has_records is set when the array holds at least one object.
+static size_t build_frame(const koios_log_entry_t* batch, size_t n,
+    uint32_t dropped, bool* has_records) {
+    char rec[KOIOS_LOG_TAG_LEN * 2 + KOIOS_LOG_MSG_LEN * 6 + 64];
+    const size_t reserve = strlen(FRAME_SUFFIX) + 1;  // "]}" + NUL
 
-static post_result_t post_batch(const char* token, const char* body, size_t body_len) {
-    (void)body_len;
-    char* auth = kp_malloc(strlen(token) + 8);
-    if (!auth) return POST_FAIL;
-    sprintf(auth, "Bearer %s", token);
-    kp_http_header_t headers[1] = { { "Authorization", auth } };
+    size_t len = strlen(FRAME_PREFIX);
+    memcpy(s.body, FRAME_PREFIX, len);
+    bool any = false;
 
-    char response[RESPONSE_BUFFER_SIZE];
-    int status = 0;
-    int err = kp_http_post(s.cfg.ingest_url, headers, 1, body,
-        "application/x-ndjson", response, sizeof(response), &status);
-    kp_free(auth);
-
-    if (err != 0) return POST_FAIL;
-    if (status >= 200 && status < 300) return POST_OK;
-    if (status == 401 || status == 403) {
-        KP_LOGW(TAG, "Log ingest rejected (%d) — token missing 'logs.write'? "
-            "fleet default_caps must include it; requesting refresh", status);
-        return POST_AUTH;
+    // Lead with a gap marker when lines were overwritten before shipping.
+    if (dropped) {
+        char note[96];
+        snprintf(note, sizeof(note),
+            "dropped %u buffered log line(s) (device buffer overflow)",
+            (unsigned)dropped);
+        size_t rl = render_record(rec, sizeof(rec), KOIOS_LOG_WARN, TAG, note, 0);
+        if (rl && len + rl + reserve <= BODY_CAP) {
+            memcpy(s.body + len, rec, rl);
+            len += rl;
+            any = true;
+        }
     }
-    KP_LOGD(TAG, "Log ingest failed (http %d)", status);
-    return POST_FAIL;
+
+    size_t packed = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t rl = render_record(rec, sizeof(rec), batch[i].level,
+            batch[i].tag, batch[i].msg, batch[i].ts_ms);
+        if (rl == 0) { packed++; continue; }  // unrenderable; skip but consume
+        size_t need = rl + (any ? 1 : 0);     // +1 for a separating comma
+        if (len + need + reserve > BODY_CAP) break;  // frame full
+        if (any) s.body[len++] = ',';
+        memcpy(s.body + len, rec, rl);
+        len += rl;
+        any = true;
+        packed++;
+    }
+
+    memcpy(s.body + len, FRAME_SUFFIX, strlen(FRAME_SUFFIX));
+    len += strlen(FRAME_SUFFIX);
+    s.body[len] = '\0';
+    *has_records = any;
+    return packed;
 }
 
-// Drain the store to the gateway. Keeps entries buffered on any failure so the
-// next flush retries them.
-static void ship_pending(const char* token) {
+// Drain the store to the gateway over the websocket. Keeps entries buffered on
+// any send failure (outbox full / link down) so the next flush retries them.
+static void ship_pending(void) {
     uint32_t dropped = kp_logstore_take_dropped();
     bool first = true;
 
@@ -155,55 +183,25 @@ static void ship_pending(const char* token) {
         size_t n = kp_logstore_peek(s.batch, s.batch_cap);
         if (n == 0 && !(first && dropped)) break;
 
-        size_t body_len = 0;
-        char rec[KOIOS_LOG_TAG_LEN * 2 + KOIOS_LOG_MSG_LEN * 6 + 64];
+        bool has_records = false;
+        size_t packed = build_frame(s.batch, n, first ? dropped : 0, &has_records);
 
-        // Lead with a gap marker when lines were overwritten before shipping.
-        if (first && dropped) {
-            char note[96];
-            snprintf(note, sizeof(note),
-                "dropped %u buffered log line(s) (device buffer overflow)",
-                (unsigned)dropped);
-            size_t rl = render_record(rec, sizeof(rec), KOIOS_LOG_WARN, TAG, note, 0);
-            if (rl && body_len + rl + 1 <= BODY_CAP) {
-                memcpy(s.body + body_len, rec, rl);
-                body_len += rl;
-                s.body[body_len++] = '\n';
-            }
-        }
-
-        size_t packed = 0;
-        for (size_t i = 0; i < n; i++) {
-            size_t rl = render_record(rec, sizeof(rec), s.batch[i].level,
-                s.batch[i].tag, s.batch[i].msg, s.batch[i].ts_ms);
-            if (rl == 0) { packed++; continue; }  // unrenderable; skip but consume
-            if (body_len + rl + 1 > BODY_CAP) break;  // batch full, ship what we have
-            memcpy(s.body + body_len, rec, rl);
-            body_len += rl;
-            s.body[body_len++] = '\n';
-            packed++;
-        }
-
-        if (body_len == 0) {
-            // Nothing renderable (pathological oversized records); drop them
-            // rather than wedging the buffer, then stop.
+        if (!has_records) {
+            // Only unrenderable entries fit; drop them rather than wedge the
+            // buffer, then stop.
             if (packed > 0) kp_logstore_consume(packed);
             break;
         }
-        s.body[body_len] = '\0';
 
-        post_result_t r = post_batch(token, s.body, body_len);
-        if (r == POST_AUTH) {
-            koios_cloudlink_request_token_refresh();
-            return;  // retry on the next flush with a fresh token
-        }
-        if (r == POST_FAIL) return;  // keep entries buffered, retry later
+        // Re-check right before sending; if the link dropped, retry next flush.
+        if (!koios_cloudlink_is_ready()) return;
+        if (!koios_cloudlink_send_text(s.body)) return;  // outbox full; keep + retry
 
         kp_logstore_consume(packed);
         first = false;
         dropped = 0;
-        if (packed < n) continue;  // buffer-capped batch; more remain
-        if (n < s.batch_cap) break;  // peeked the whole store
+        if (packed < n) continue;       // frame-capped batch; more remain
+        if (n < s.batch_cap) break;     // peeked the whole store
         // n == batch_cap: there may be more; loop again.
     }
 }
@@ -211,20 +209,19 @@ static void ship_pending(const char* token) {
 static void ship_task(void* arg) {
     (void)arg;
     kp_logstore_mark_ship_task();
-    KP_LOGI(TAG, "Log shipping active (endpoint: %s, every %ums, buffer %u lines)",
-        s.cfg.ingest_url, (unsigned)s.flush_interval_ms,
-        (unsigned)kp_logstore_capacity());
+    KP_LOGI(TAG, "Log shipping active (over cloudlink, every %ums, buffer %u lines)",
+        (unsigned)s.flush_interval_ms, (unsigned)kp_logstore_capacity());
 
     for (;;) {
-        kp_sem_take(s.wake, s.flush_interval_ms);
+        // Poll readiness quickly while a backlog waits for the link; otherwise
+        // sleep the full flush interval (woken early by an error line, a full
+        // buffer, or network-up).
+        bool waiting = kp_logstore_pending() > 0 && !koios_cloudlink_is_ready();
+        kp_sem_take(s.wake, waiting ? READY_POLL_MS : s.flush_interval_ms);
 
-        if (!kp_net_is_connected()) continue;
+        if (!koios_cloudlink_is_ready()) continue;
         if (kp_logstore_pending() == 0) continue;
-
-        char* token = koios_cloudlink_get_token_copy();
-        if (!token) continue;  // no session yet; lines wait (and survive resets)
-        ship_pending(token);
-        kp_free(token);
+        ship_pending();
     }
 }
 
@@ -233,24 +230,23 @@ static void wake_ship(void) {
 }
 
 static void on_net_connect(void) {
-    // Push the reset-survived tail out promptly, before it ages past the
-    // backend's acceptance window.
+    // Nudge the ship task when the interface comes up; it still waits for the
+    // cloudlink session to be ready before sending.
     wake_ship();
 }
 
 void koios_logship_init(const koios_logship_config_t* config) {
     if (s.running) return;
-    if (config) s.cfg = *config;
-    if (!s.cfg.ingest_url) s.cfg.ingest_url = DEFAULT_INGEST_URL;
-    s.flush_interval_ms = s.cfg.flush_interval_ms ? s.cfg.flush_interval_ms
-                                                  : DEFAULT_FLUSH_INTERVAL_MS;
+    s.flush_interval_ms = (config && config->flush_interval_ms)
+        ? config->flush_interval_ms
+        : DEFAULT_FLUSH_INTERVAL_MS;
 
     // Capture first so boot lines are recorded even if the rest fails.
     kp_logstore_init();
 
     s.batch_cap = kp_logstore_capacity();
     s.batch = kp_malloc(s.batch_cap * sizeof(koios_log_entry_t));
-    s.body = kp_malloc(BODY_CAP + 1);  // +1 for the NUL after a full body
+    s.body = kp_malloc(BODY_CAP + 1);  // +1 for the NUL after a full frame
     s.wake = kp_sem_create();
     if (!s.batch || !s.body || !s.wake) {
         KP_LOGE(TAG, "Failed to allocate ship buffers; capture only");
