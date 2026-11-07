@@ -14,7 +14,7 @@ typedef void (*kp_net_event_fn)(void);
 bool kp_net_is_connected(void);
 
 // Register connectivity callbacks. Either may be NULL. The port supports at
-// least 4 subscribers (cloudlink + OTA + app slack). Callbacks fire from the
+// least 6 subscribers (cloudlink + OTA + logship + app slack). Callbacks fire from the
 // port's event context; treat like an ISR-adjacent context and defer real work.
 void kp_net_subscribe(kp_net_event_fn on_connect, kp_net_event_fn on_disconnect);
 

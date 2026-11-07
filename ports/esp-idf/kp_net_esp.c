@@ -19,7 +19,8 @@
 
 static const char* TAG = "kp_net";
 
-#define MAX_SUBSCRIBERS 4
+// cloudlink + OTA + logship from the SDK, leaving room for the app.
+#define MAX_SUBSCRIBERS 6
 
 static struct {
     bool registered;

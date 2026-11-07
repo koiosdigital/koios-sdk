@@ -23,6 +23,15 @@ int kp_http_get(const char* url,
                 char* buf, size_t buf_size,
                 int* status_code);
 
+// Perform a POST with an explicit Content-Type (e.g. application/x-ndjson for
+// log batches). Same response/return semantics as kp_http_get. content_type
+// NULL -> application/json.
+int kp_http_post(const char* url,
+                 const kp_http_header_t* headers, size_t header_count,
+                 const char* body, const char* content_type,
+                 char* buf, size_t buf_size,
+                 int* status_code);
+
 // Perform a POST with a JSON body (Content-Type: application/json). Same
 // response/return semantics as kp_http_get.
 int kp_http_post_json(const char* url,

@@ -8,8 +8,10 @@ idf_component_register(
     SRCS
         "core/cloudlink.c"
         "core/ota.c"
+        "core/logship.c"
         "ports/esp-idf/kp_os_esp.c"
         "ports/esp-idf/kp_log_esp.c"
+        "ports/esp-idf/kp_logstore_esp.c"
         "ports/esp-idf/kp_net_esp.c"
         "ports/esp-idf/kp_http_esp.c"
         "ports/esp-idf/kp_identity_esp.c"
@@ -27,6 +29,8 @@ idf_component_register(
         esp_http_client
         esp_https_ota
         esp_hw_support
+        esp_common
+        freertos
         app_update
         spi_flash
         mbedtls

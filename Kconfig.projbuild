@@ -27,4 +27,58 @@ menu "Koios SDK Configuration"
             do (protobuf unpack, NVS writes). Raise it if you see a stack
             overflow in "websocket_task".
 
+    config KOIOS_SDK_LOGS_ENABLE
+        bool "Ship device logs to Koios (POST /v1/logs)"
+        default n
+        help
+            Capture every ESP_LOGx line, buffer it in RTC-retained memory so
+            it survives resets/brownouts/deep sleep, and stream batches as
+            NDJSON to the Koios gateway using the cloudlink device token.
+            Off by default; the device's fleet must also grant the
+            `logs.write` capability (fleet default_caps) or the gateway
+            answers 403. When disabled, no capture hook, task, or
+            RTC footprint is added.
+
+    if KOIOS_SDK_LOGS_ENABLE
+
+        config KOIOS_SDK_LOGS_RTC_RECORDS
+            int "Buffered log lines (RTC ring capacity)"
+            default 16
+            range 4 128
+            help
+                Number of log lines held in RTC-retained memory. Each slot is
+                roughly TAG_LEN + MSG_LEN + 16 bytes and lives in RTC slow
+                memory, which is small (~8 KiB on the ESP32-S3) and shared, so
+                raise this only as far as the link still places it.
+
+        config KOIOS_SDK_LOGS_TAG_LEN
+            int "Max stored tag length (bytes, incl. NUL)"
+            default 16
+            range 8 32
+
+        config KOIOS_SDK_LOGS_MSG_LEN
+            int "Max stored message length (bytes, incl. NUL)"
+            default 160
+            range 32 512
+            help
+                Longer lines are truncated in the RTC ring. Keep modest — it
+                multiplies by the ring capacity against RTC memory.
+
+        config KOIOS_SDK_LOGS_FLUSH_INTERVAL_MS
+            int "Flush interval (ms)"
+            default 60000
+            help
+                How often the ship task forwards buffered lines. It also
+                flushes early on an error-level line, a near-full buffer, or
+                when the network comes up.
+
+        config KOIOS_SDK_LOGS_BODY_BYTES
+            int "Max NDJSON batch body (bytes)"
+            default 16384
+            help
+                Upper bound on a single POST body; larger backlogs ship across
+                several batches. Allocated once from the SDK buffer pool.
+
+    endif
+
 endmenu

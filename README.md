@@ -30,6 +30,7 @@ identity, RTOS primitives.
 | `kp_identity` | client cert + opaque key handle | kd_common crypto (DS peripheral) |
 | `kp_websocket` | complete-message WS client | esp_websocket_client + cert bundle |
 | `kp_ota` | download/verify/flash an image + pending-update record | esp_https_ota (streamed sha256) + NVS |
+| `kp_logstore` | reset-surviving leveled-log capture + ring | esp_log_set_vprintf hook + RTC_NOINIT ring |
 
 The private key never crosses the port boundary: `kp_identity` hands out an
 opaque context (`esp_ds_data_ctx_t*` on ESP32) that `kp_websocket` feeds to
@@ -52,6 +53,7 @@ then:
 ```c
 #include <koios/cloudlink.h>
 #include <koios/ota.h>
+#include <koios/logship.h>
 
 kd_common_init();
 
@@ -64,6 +66,8 @@ koios_cloudlink_config_t link = {
     .on_session_ready = my_hello,         // send device info, claims, ...
 };
 koios_cloudlink_init(&link);
+
+koios_logship_init(NULL);   // opt-in (Kconfig); off unless enabled
 ```
 
 Text frames are the shared control channel (`welcome` / `token` /
@@ -71,9 +75,39 @@ Text frames are the shared control channel (`welcome` / `token` /
 app-specific protocol (protobuf in current firmwares) and pass through
 untouched.
 
+## Log shipping
+
+`koios_logship_init()` hooks the ESP-IDF logger (`esp_log_set_vprintf`) and
+captures every `ESP_LOGx` line — level, tag, message, and a wall-clock
+timestamp — into a ring buffer in **RTC-retained memory**, so the lines written
+just before a reset, brownout, or deep sleep survive it. A background task
+drains the ring and streams batches as **NDJSON** to `POST /v1/logs` on the
+gateway (`https://vn.koios.sh/v1/logs` by default), authenticated with the same
+cloudlink device JWT OTA uses — the JWT ingest path is host-agnostic, so mTLS
+devices stay on the plain `vn` ingress too. It flushes on a timer, on an
+error-level line, on a near-full buffer, and when the network comes up (to push
+the reset-survived tail out before the backend's acceptance window closes).
+Lines captured before the clock syncs ship without a timestamp and the gateway
+stamps them at receive time.
+
+The feature is **opt-in and off by default**, gated by
+`CONFIG_KOIOS_SDK_LOGS_ENABLE` (mirroring how the app opts into OTA). When
+disabled, `koios_logship_init()` is a no-op and the component adds no capture
+hook, task, or RTC footprint. Buffer sizing (ring capacity, tag/message caps),
+flush cadence, and max batch body are Kconfig options.
+
+> **Capability:** the device JWT must carry `logs.write`. That capability is in
+> `DEVICE_CAPS` but **not** in `DEFAULT_DEVICE_CAPS`, so a fleet only hands it to
+> its devices if its `default_caps` includes `logs.write`. Without it the
+> gateway answers `403` and the ship task logs a warning and backs off until the
+> next flush.
+
+Crash scope: RTC survival of the pre-reboot log tail is what this provides.
+Coredump capture (`esp_core_dump`) is a possible later add and is out of scope.
+
 ## Porting
 
-Implement the nine `kp_*` headers under `include/koios/port/` for the new
+Implement the `kp_*` port headers under `include/koios/port/` for the new
 platform and compile `core/` with them. The core has no RTOS, socket, or
 TLS assumptions beyond those contracts; cJSON is its only library
 dependency.
