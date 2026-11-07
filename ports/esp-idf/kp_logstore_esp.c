@@ -1,11 +1,13 @@
-// RTC-retained log store + capture hook (ESP-IDF).
+// RTC-retained byte-ring log store + capture hook (ESP-IDF).
 //
 // Installs an esp_log_set_vprintf() hook that forwards every line to the
-// previous sink (so the console still works) and parks a structured copy in a
-// ring buffer held in RTC_NOINIT memory. RTC memory keeps its contents across
-// resets, brownouts, and deep sleep, so the lines written just before a reboot
-// survive it and ship once the device is back online. This is the lean
-// RTC-store technique from esp-insights, not the whole agent.
+// previous sink (so the console still works) and packs a structured copy into a
+// fixed byte ring held in RTC_NOINIT memory. RTC memory keeps its contents
+// across resets, brownouts, and deep sleep, so the lines written just before a
+// reboot survive it and ship once the device is back online. The ring is sized
+// in BYTES, not lines: variable-length records are packed in and the oldest are
+// evicted when it fills. This is the lean RTC-store technique from esp-insights,
+// not the whole agent.
 
 #include "koios/port/kp_logstore.h"
 #include "koios/port/kp_log.h"
@@ -25,27 +27,35 @@
 #include <string.h>
 #include <sys/time.h>
 
-#ifdef CONFIG_KOIOS_SDK_LOGS_RTC_RECORDS
-#define RING_CAPACITY CONFIG_KOIOS_SDK_LOGS_RTC_RECORDS
+#ifdef CONFIG_KOIOS_SDK_LOGS_RTC_BYTES
+#define RING_BYTES CONFIG_KOIOS_SDK_LOGS_RTC_BYTES
 #else
-#define RING_CAPACITY 16
+#define RING_BYTES 2048
 #endif
 
 #define RTC_STORE_MAGIC 0x4B4C4F47u  // "KLOG"
-// Flush early once the buffer is this full, before overwrite starts.
-#define HIGH_WATER ((RING_CAPACITY * 3) / 4)
 // Longest formatted line we parse; the stored message is capped separately.
 #define KP_LOG_LINE_MAX 320
 
+// One stored record: a packed header, then tag_len tag bytes, then msg_len msg
+// bytes. memcpy'd in/out of the ring, so its alignment in the buffer is moot.
+typedef struct __attribute__((packed)) {
+    int64_t  ts_ms;
+    uint8_t  level;
+    uint8_t  tag_len;
+    uint16_t msg_len;
+} rec_hdr_t;
+
 // Retained across resets/deep sleep. NOT cleared at startup — guarded by a
-// magic so a cold boot (or a layout change) starts from a clean ring.
+// magic + size so a cold boot (or a ring-size change) starts from a clean ring.
 typedef struct {
     uint32_t magic;
-    uint32_t head;      // index of oldest entry
-    uint32_t count;     // entries currently stored
-    uint32_t seq;       // ever-increasing capture counter
-    uint32_t dropped;   // entries overwritten before they could ship
-    koios_log_entry_t entries[RING_CAPACITY];
+    uint32_t size;      // RING_BYTES this buffer was framed for
+    uint32_t head;      // byte offset of the oldest record
+    uint32_t tail;      // byte offset of the next write
+    uint32_t used;      // bytes currently stored
+    uint32_t dropped;   // records evicted before they could ship
+    uint8_t  buf[RING_BYTES];
 } rtc_store_t;
 
 static RTC_NOINIT_ATTR rtc_store_t s_rtc;
@@ -55,6 +65,63 @@ static vprintf_like_t s_prev_vprintf;
 static void (*s_notify)(void);
 static TaskHandle_t s_ship_task;
 static bool s_installed;
+
+//------------------------------------------------------------------------------
+// Byte-ring primitives (call under s_mux)
+//------------------------------------------------------------------------------
+
+static void ring_write(const void* src, size_t n) {
+    const uint8_t* p = (const uint8_t*)src;
+    size_t first = RING_BYTES - s_rtc.tail;
+    if (first > n) first = n;
+    memcpy(&s_rtc.buf[s_rtc.tail], p, first);
+    if (n > first) memcpy(&s_rtc.buf[0], p + first, n - first);
+    s_rtc.tail = (uint32_t)((s_rtc.tail + n) % RING_BYTES);
+}
+
+static void ring_read(size_t off, void* dst, size_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    size_t first = RING_BYTES - off;
+    if (first > n) first = n;
+    memcpy(d, &s_rtc.buf[off], first);
+    if (n > first) memcpy(d + first, &s_rtc.buf[0], n - first);
+}
+
+static size_t record_size_at(size_t off) {
+    rec_hdr_t h;
+    ring_read(off, &h, sizeof(h));
+    return sizeof(rec_hdr_t) + h.tag_len + h.msg_len;
+}
+
+static void evict_oldest(void) {
+    size_t rs = record_size_at(s_rtc.head);
+    if (rs > s_rtc.used) rs = s_rtc.used;  // corruption guard
+    s_rtc.head = (uint32_t)((s_rtc.head + rs) % RING_BYTES);
+    s_rtc.used -= rs;
+    s_rtc.dropped++;
+}
+
+static void push_record(int64_t ts_ms, uint8_t level, const char* tag, const char* msg) {
+    rec_hdr_t h;
+    size_t tl = strlen(tag);
+    size_t ml = strlen(msg);
+    if (tl > 255) tl = 255;
+    if (ml > 0xFFFF) ml = 0xFFFF;
+    h.ts_ms = ts_ms;
+    h.level = level;
+    h.tag_len = (uint8_t)tl;
+    h.msg_len = (uint16_t)ml;
+    size_t rec = sizeof(rec_hdr_t) + tl + ml;
+    if (rec > RING_BYTES) return;  // a single record can never exceed the ring
+
+    portENTER_CRITICAL(&s_mux);
+    while (s_rtc.used + rec > RING_BYTES) evict_oldest();
+    ring_write(&h, sizeof(h));
+    ring_write(tag, tl);
+    ring_write(msg, ml);
+    s_rtc.used += (uint32_t)rec;
+    portEXIT_CRITICAL(&s_mux);
+}
 
 //------------------------------------------------------------------------------
 // Line parsing: "<L> (<ts>) <TAG>: <message>" with optional ANSI color, the
@@ -87,13 +154,14 @@ static void strip_ansi(char* s) {
     while (w > s && (w[-1] == '\n' || w[-1] == '\r')) *--w = '\0';
 }
 
-static void parse_line(char* line, koios_log_entry_t* e) {
+// Parse a formatted line into level + NUL-terminated tag/msg (both truncated).
+static uint8_t parse_line(char* line, char* tag, size_t tag_cap, char* msg, size_t msg_cap) {
     strip_ansi(line);
 
-    e->level = KOIOS_LOG_NONE;
-    e->tag[0] = '\0';
+    uint8_t level = KOIOS_LOG_NONE;
+    tag[0] = '\0';
+    const char* src = line;
 
-    const char* msg = line;
     // "<L> (<ts>) <TAG>: <msg>"
     if (line[0] && line[1] == ' ' && line[2] == '(') {
         uint8_t lvl = level_from_letter(line[0]);
@@ -102,17 +170,18 @@ static void parse_line(char* line, koios_log_entry_t* e) {
             char* tag_start = paren + 2;
             char* colon = strstr(tag_start, ": ");
             if (colon) {
-                e->level = lvl;
-                size_t tag_len = (size_t)(colon - tag_start);
-                if (tag_len >= sizeof(e->tag)) tag_len = sizeof(e->tag) - 1;
-                memcpy(e->tag, tag_start, tag_len);
-                e->tag[tag_len] = '\0';
-                msg = colon + 2;
+                level = lvl;
+                size_t tl = (size_t)(colon - tag_start);
+                if (tl >= tag_cap) tl = tag_cap - 1;
+                memcpy(tag, tag_start, tl);
+                tag[tl] = '\0';
+                src = colon + 2;
             }
         }
     }
 
-    strlcpy(e->msg, msg, sizeof(e->msg));
+    strlcpy(msg, src, msg_cap);
+    return level;
 }
 
 //------------------------------------------------------------------------------
@@ -130,39 +199,27 @@ static int log_vprintf(const char* fmt, va_list ap) {
 
     int ret = s_prev_vprintf ? s_prev_vprintf(fmt, ap) : vprintf(fmt, ap);
 
-    // Never capture the ship task's own output (and the HTTP/TLS chatter it
-    // drives on the same task) — that would feed the buffer during a flush.
+    // Never capture the ship task's own output — that would feed the buffer.
     if (s_ship_task && xTaskGetCurrentTaskHandle() == s_ship_task) return ret;
 
-    koios_log_entry_t e = { 0 };
-    parse_line(line, &e);
-    if (e.msg[0] == '\0') return ret;  // nothing worth keeping
+    char tag[KOIOS_LOG_TAG_LEN];
+    char msg[KOIOS_LOG_MSG_LEN];
+    uint8_t level = parse_line(line, tag, sizeof(tag), msg, sizeof(msg));
+    if (msg[0] == '\0') return ret;  // nothing worth keeping
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
     // Below ~2020 the clock hasn't synced; leave ts_ms 0 so the server stamps
     // receive time instead of a bogus (rejected-as-too-old) timestamp.
-    e.ts_ms = (tv.tv_sec > 1600000000)
+    int64_t ts_ms = (tv.tv_sec > 1600000000)
         ? (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000
         : 0;
 
-    bool want_flush;
-    portENTER_CRITICAL(&s_mux);
-    e.seq = ++s_rtc.seq;
-    uint32_t slot;
-    if (s_rtc.count < RING_CAPACITY) {
-        slot = (s_rtc.head + s_rtc.count) % RING_CAPACITY;
-        s_rtc.count++;
-    } else {
-        slot = s_rtc.head;                       // overwrite oldest
-        s_rtc.head = (s_rtc.head + 1) % RING_CAPACITY;
-        s_rtc.dropped++;
-    }
-    s_rtc.entries[slot] = e;
-    want_flush = (e.level == KOIOS_LOG_ERROR) || (s_rtc.count >= HIGH_WATER);
-    portEXIT_CRITICAL(&s_mux);
+    push_record(ts_ms, level, tag, msg);
 
-    if (want_flush && s_notify) s_notify();
+    // Ship as it arrives: nudge the ship task on every line (it forwards only
+    // while the session is ready, so an offline nudge is a cheap no-op).
+    if (s_notify) s_notify();
     return ret;
 }
 
@@ -174,50 +231,77 @@ void kp_logstore_init(void) {
     if (s_installed) return;
 
     portENTER_CRITICAL(&s_mux);
-    if (s_rtc.magic != RTC_STORE_MAGIC) {
-        // Cold boot or incompatible layout: start clean.
+    if (s_rtc.magic != RTC_STORE_MAGIC || s_rtc.size != RING_BYTES) {
+        // Cold boot or a ring-size change: start clean.
         s_rtc.magic = RTC_STORE_MAGIC;
-        s_rtc.head = s_rtc.count = s_rtc.seq = s_rtc.dropped = 0;
+        s_rtc.size = RING_BYTES;
+        s_rtc.head = s_rtc.tail = s_rtc.used = s_rtc.dropped = 0;
     }
-    uint32_t survived = s_rtc.count;
+    uint32_t survived = s_rtc.used;
     portEXIT_CRITICAL(&s_mux);
 
     s_prev_vprintf = esp_log_set_vprintf(log_vprintf);
     s_installed = true;
 
     if (survived) {
-        KP_LOGI("koios_logship", "recovered %u buffered log line(s) from last boot",
+        KP_LOGI("koios_logship", "recovered %u buffered log byte(s) from last boot",
             (unsigned)survived);
     }
 }
 
-size_t kp_logstore_capacity(void) {
-    return RING_CAPACITY;
-}
-
-size_t kp_logstore_pending(void) {
+size_t kp_logstore_used(void) {
     portENTER_CRITICAL(&s_mux);
-    size_t n = s_rtc.count;
+    size_t n = s_rtc.used;
     portEXIT_CRITICAL(&s_mux);
     return n;
+}
+
+size_t kp_logstore_capacity_bytes(void) {
+    return RING_BYTES;
 }
 
 size_t kp_logstore_peek(koios_log_entry_t* out, size_t max) {
     if (!out || max == 0) return 0;
     portENTER_CRITICAL(&s_mux);
-    size_t n = s_rtc.count < max ? s_rtc.count : max;
-    for (size_t i = 0; i < n; i++) {
-        out[i] = s_rtc.entries[(s_rtc.head + i) % RING_CAPACITY];
+    size_t off = s_rtc.head;
+    size_t remaining = s_rtc.used;
+    size_t count = 0;
+    while (count < max && remaining >= sizeof(rec_hdr_t)) {
+        rec_hdr_t h;
+        ring_read(off, &h, sizeof(h));
+        size_t rs = sizeof(rec_hdr_t) + h.tag_len + h.msg_len;
+        if (rs > remaining) break;  // partial/corrupt guard
+
+        size_t tcap = sizeof(out[count].tag) - 1;
+        size_t tcopy = h.tag_len < tcap ? h.tag_len : tcap;
+        ring_read((off + sizeof(rec_hdr_t)) % RING_BYTES, out[count].tag, tcopy);
+        out[count].tag[tcopy] = '\0';
+
+        size_t mcap = sizeof(out[count].msg) - 1;
+        size_t mcopy = h.msg_len < mcap ? h.msg_len : mcap;
+        ring_read((off + sizeof(rec_hdr_t) + h.tag_len) % RING_BYTES, out[count].msg, mcopy);
+        out[count].msg[mcopy] = '\0';
+
+        out[count].ts_ms = h.ts_ms;
+        out[count].level = h.level;
+
+        off = (off + rs) % RING_BYTES;
+        remaining -= rs;
+        count++;
     }
     portEXIT_CRITICAL(&s_mux);
-    return n;
+    return count;
 }
 
 void kp_logstore_consume(size_t n) {
     portENTER_CRITICAL(&s_mux);
-    if (n > s_rtc.count) n = s_rtc.count;
-    s_rtc.head = (s_rtc.head + n) % RING_CAPACITY;
-    s_rtc.count -= n;
+    while (n > 0 && s_rtc.used >= sizeof(rec_hdr_t)) {
+        size_t rs = record_size_at(s_rtc.head);
+        if (rs > s_rtc.used) break;
+        s_rtc.head = (uint32_t)((s_rtc.head + rs) % RING_BYTES);
+        s_rtc.used -= (uint32_t)rs;
+        n--;
+    }
     portEXIT_CRITICAL(&s_mux);
 }
 

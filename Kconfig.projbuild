@@ -41,15 +41,16 @@ menu "Koios SDK Configuration"
 
     if KOIOS_SDK_LOGS_ENABLE
 
-        config KOIOS_SDK_LOGS_RTC_RECORDS
-            int "Buffered log lines (RTC ring capacity)"
-            default 16
-            range 4 128
+        config KOIOS_SDK_LOGS_RTC_BYTES
+            int "RTC log ring size (bytes)"
+            default 2048
+            range 512 8192
             help
-                Number of log lines held in RTC-retained memory. Each slot is
-                roughly TAG_LEN + MSG_LEN + 16 bytes and lives in RTC slow
-                memory, which is small (~8 KiB on the ESP32-S3) and shared, so
-                raise this only as far as the link still places it.
+                Size of the RTC-retained byte ring that buffers log lines while
+                the websocket is down (when it is up, lines ship as they
+                arrive). Variable-length records are packed in; the oldest are
+                evicted when it fills. Lives in RTC slow memory, which is small
+                (~8 KiB on the ESP32-S3) and shared, so keep it modest.
 
         config KOIOS_SDK_LOGS_TAG_LEN
             int "Max stored tag length (bytes, incl. NUL)"
@@ -65,12 +66,12 @@ menu "Koios SDK Configuration"
                 multiplies by the ring capacity against RTC memory.
 
         config KOIOS_SDK_LOGS_FLUSH_INTERVAL_MS
-            int "Flush interval (ms)"
+            int "Retry/fallback interval (ms)"
             default 60000
             help
-                How often the ship task forwards buffered lines. It also
-                flushes early on an error-level line, a near-full buffer, or
-                when the network comes up.
+                Lines ship as they arrive while the session is ready. This
+                interval only bounds how long a backlog waits after a failed
+                send, or before the session first comes up.
 
         config KOIOS_SDK_LOGS_BODY_BYTES
             int "Max log frame body (bytes)"

@@ -25,8 +25,10 @@ extern "C" {
 #endif
 
 typedef struct {
-    // Flush cadence in milliseconds. 0 -> the Kconfig default. The task also
-    // flushes early on an error-level line, a full buffer, and network-up.
+    // Retry/fallback cadence in milliseconds. 0 -> the Kconfig default. Lines
+    // ship as they arrive while the session is ready (capture nudges the ship
+    // task per line); this interval only bounds how long a backlog waits after
+    // a failed send or before the session first comes up.
     uint32_t flush_interval_ms;
 } koios_logship_config_t;
 

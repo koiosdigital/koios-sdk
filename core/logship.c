@@ -52,6 +52,9 @@ static const char* TAG = "koios_logship";
 // this short cadence instead of the full flush interval, so the reset-survived
 // tail ships promptly once the link comes up.
 #define READY_POLL_MS         3000
+// Records decoded from the byte ring per peek; a larger backlog drains across
+// several peeks. Bounds the scratch array, independent of the ring's byte size.
+#define PEEK_BATCH            16
 
 static const char* FRAME_PREFIX = "{\"type\":\"logs\",\"logs\":[";
 static const char* FRAME_SUFFIX = "]}";
@@ -209,18 +212,18 @@ static void ship_pending(void) {
 static void ship_task(void* arg) {
     (void)arg;
     kp_logstore_mark_ship_task();
-    KP_LOGI(TAG, "Log shipping active (over cloudlink, every %ums, buffer %u lines)",
-        (unsigned)s.flush_interval_ms, (unsigned)kp_logstore_capacity());
+    KP_LOGI(TAG, "Log shipping active (over cloudlink, ship-on-arrival, %u-byte buffer)",
+        (unsigned)kp_logstore_capacity_bytes());
 
     for (;;) {
-        // Poll readiness quickly while a backlog waits for the link; otherwise
-        // sleep the full flush interval (woken early by an error line, a full
-        // buffer, or network-up).
-        bool waiting = kp_logstore_pending() > 0 && !koios_cloudlink_is_ready();
+        // Capture nudges this task per line, so a ready link ships as lines
+        // arrive. Poll readiness quickly while a backlog waits for the link;
+        // otherwise sleep the full interval as a retry/fallback.
+        bool waiting = kp_logstore_used() > 0 && !koios_cloudlink_is_ready();
         kp_sem_take(s.wake, waiting ? READY_POLL_MS : s.flush_interval_ms);
 
         if (!koios_cloudlink_is_ready()) continue;
-        if (kp_logstore_pending() == 0) continue;
+        if (kp_logstore_used() == 0) continue;
         ship_pending();
     }
 }
@@ -244,7 +247,7 @@ void koios_logship_init(const koios_logship_config_t* config) {
     // Capture first so boot lines are recorded even if the rest fails.
     kp_logstore_init();
 
-    s.batch_cap = kp_logstore_capacity();
+    s.batch_cap = PEEK_BATCH;
     s.batch = kp_malloc(s.batch_cap * sizeof(koios_log_entry_t));
     s.body = kp_malloc(BODY_CAP + 1);  // +1 for the NUL after a full frame
     s.wake = kp_sem_create();

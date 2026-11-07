@@ -6,10 +6,12 @@
 // crash still ship after the device comes back up. The portable ship policy
 // (core/logship.c) drains this store and forwards batches to the Koios gateway.
 //
-// Capture runs from arbitrary task contexts, so the port must keep the push
-// path short and lock-safe; the drain/consume calls run only from the ship
-// task. Entries are fixed-size and self-contained (no pointers) so the ring
-// can live in a noinit region.
+// The store is a **byte-sized ring** (not a fixed line count): variable-length
+// records are packed into a fixed byte budget, and the oldest are evicted when
+// it fills. Capture runs from arbitrary task contexts, so the port keeps the
+// push path short and lock-safe; the peek/consume calls run only from the ship
+// task. Records are self-contained (no pointers) so the ring lives in a noinit
+// region, and each line is truncated to the tag/message caps below.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -18,8 +20,8 @@
 extern "C" {
 #endif
 
-// Inline field sizes. Fixed so a record is self-contained in retained memory;
-// overridable via Kconfig to trade RTC footprint against truncation.
+// Per-line field caps. A line longer than these is truncated before storage,
+// which bounds a single record and the decode buffers; overridable via Kconfig.
 #ifdef CONFIG_KOIOS_SDK_LOGS_TAG_LEN
 #define KOIOS_LOG_TAG_LEN CONFIG_KOIOS_SDK_LOGS_TAG_LEN
 #else
@@ -41,42 +43,43 @@ typedef enum {
     KOIOS_LOG_VERBOSE,
 } koios_log_level_t;
 
+// A decoded record handed to the ship policy. The ring stores records packed by
+// their actual byte length; peek decodes them into this fixed shape.
 typedef struct {
-    int64_t  ts_ms;   // wall-clock ms at capture, or 0 if the clock was unsynced
-    uint32_t seq;     // capture sequence, for stable ordering / debugging
-    uint8_t  level;   // koios_log_level_t
-    char     tag[KOIOS_LOG_TAG_LEN];   // NUL-terminated, truncated
-    char     msg[KOIOS_LOG_MSG_LEN];   // NUL-terminated, truncated
+    int64_t ts_ms;   // wall-clock ms at capture, or 0 if the clock was unsynced
+    uint8_t level;   // koios_log_level_t
+    char    tag[KOIOS_LOG_TAG_LEN];   // NUL-terminated, truncated
+    char    msg[KOIOS_LOG_MSG_LEN];   // NUL-terminated, truncated
 } koios_log_entry_t;
 
-// Set up retained storage (validating/clearing it on a cold boot) and install
-// the capture hook. Safe to call once; subsequent calls are ignored.
+// Set up the retained byte ring (validating/clearing it on a cold boot or a
+// size/layout change) and install the capture hook. Safe to call once.
 void kp_logstore_init(void);
 
-// Number of entries currently buffered and ready to ship.
-size_t kp_logstore_pending(void);
+// Bytes of records currently buffered (0 when empty).
+size_t kp_logstore_used(void);
 
-// Capacity of the store (max entries it can hold).
-size_t kp_logstore_capacity(void);
+// Total size of the ring in bytes.
+size_t kp_logstore_capacity_bytes(void);
 
-// Copy up to max of the oldest entries into out (oldest first) without
-// removing them. Returns the number copied.
+// Decode up to max of the oldest records into out (oldest first) without
+// removing them. Returns the number decoded.
 size_t kp_logstore_peek(koios_log_entry_t* out, size_t max);
 
-// Drop the n oldest entries. Call after a batch has been accepted upstream.
+// Drop the n oldest records. Call after a batch has been shipped.
 void kp_logstore_consume(size_t n);
 
-// Return and clear the count of entries dropped because the store was full
+// Return and clear the count of records dropped because the ring was full
 // (oldest-overwritten). Lets the ship policy surface a gap marker.
 uint32_t kp_logstore_take_dropped(void);
 
-// Register a callback invoked (from the capture context) when a prompt flush
-// is warranted — an error-level line, or the store crossing its high-water
-// mark. The callback must be ISR-adjacent-safe and quick (e.g. post a sem).
+// Register a callback invoked (from the capture context) after every stored
+// line, so the ship task can forward it as it arrives. Must be ISR-adjacent-
+// safe and quick (e.g. post a sem).
 void kp_logstore_set_notify(void (*cb)(void));
 
-// Mark the calling task as the ship task: its own log output (and the HTTP /
-// TLS chatter it drives) is not captured, preventing a shipping feedback loop.
+// Mark the calling task as the ship task: its own log output is not captured,
+// preventing a shipping feedback loop.
 void kp_logstore_mark_ship_task(void);
 
 #ifdef __cplusplus

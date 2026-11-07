@@ -79,10 +79,14 @@ untouched.
 
 `koios_logship_init()` hooks the ESP-IDF logger (`esp_log_set_vprintf`) and
 captures every `ESP_LOGx` line — level, tag, message, and a wall-clock
-timestamp — into a ring buffer in **RTC-retained memory**, so the lines written
-just before a reset, brownout, or deep sleep survive it. A background task
-drains the ring and streams batches to the gateway as a text control frame over
-the **existing cloudlink websocket**:
+timestamp — into a **byte-sized ring in RTC-retained memory** (2 KiB by
+default), so the lines written just before a reset, brownout, or deep sleep
+survive it. The ring is sized in bytes, not lines: variable-length records pack
+in and the oldest are evicted when it fills.
+
+While the cloudlink session is up, lines **ship as they arrive** — capture nudges
+the ship task per line, which forwards them straight away as a text control
+frame over the **existing cloudlink websocket**:
 
 ```json
 {"type":"logs","logs":[{"level":"info","tag":"wifi","message":"...","ts":1699999999000}, ...]}
@@ -92,17 +96,17 @@ Because the frame rides the already-authenticated device session, the gateway
 stamps the connection's `device_id`/`fleet_id`/`tenant_id` onto every line — so
 there is **no separate log host, no bearer token, and no `logs.write`
 capability** to provision per fleet. This works the same for mTLS and API-key
-devices (the socket is the device's one authenticated channel). It flushes on a
-timer, on an error-level line, on a near-full buffer, and on network-up; while a
-backlog waits it polls the session readiness so the reset-survived tail ships
-promptly once the link is up. Lines captured before the clock syncs ship without
-a timestamp and the gateway stamps them at receive time.
+devices (the socket is the device's one authenticated channel). When the link is
+down, lines accumulate in the ring and flush once the session is ready (the ship
+task polls readiness so the reset-survived tail goes out promptly). Lines
+captured before the clock syncs ship without a timestamp and the gateway stamps
+them at receive time.
 
 The feature is **opt-in and off by default**, gated by
 `CONFIG_KOIOS_SDK_LOGS_ENABLE` (mirroring how the app opts into OTA). When
 disabled, `koios_logship_init()` is a no-op and the component adds no capture
-hook, task, or RTC footprint. Buffer sizing (ring capacity, tag/message caps),
-flush cadence, and max frame body are Kconfig options.
+hook, task, or RTC footprint. Ring byte size, tag/message caps, the
+retry/fallback interval, and max frame body are Kconfig options.
 
 Crash scope: RTC survival of the pre-reboot log tail is what this provides.
 Coredump capture (`esp_core_dump`) is a possible later add and is out of scope.
