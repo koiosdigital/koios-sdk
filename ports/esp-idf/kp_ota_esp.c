@@ -1,6 +1,8 @@
 #include "koios/port/kp_ota.h"
 #include "koios/port/kp_log.h"
 
+#include "sdkconfig.h"
+
 #include <esp_https_ota.h>
 #include <esp_ota_ops.h>
 #include <esp_http_client.h>
@@ -252,6 +254,11 @@ void kp_ota_get_app_desc(char* project, size_t project_size,
     if (version && version_size) {
         strlcpy(version, desc->version, version_size);
     }
+}
+
+const char* kp_ota_get_device_class(void) {
+    // The silicon target the image was built for (esp32, esp32s3, ...).
+    return CONFIG_IDF_TARGET;
 }
 
 //------------------------------------------------------------------------------

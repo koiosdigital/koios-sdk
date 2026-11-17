@@ -22,6 +22,10 @@ typedef struct {
     const char* bearer;      // Authorization: Bearer value, or NULL
     const char* sha256_hex;  // expected image sha256 (lowercase hex), or NULL to skip
     size_t size;             // expected size in bytes, 0 to skip the check
+    // What is being installed, for ports that hand the image to an external
+    // installer. May be NULL.
+    const char* version;
+    const char* update_id;
 } kp_ota_image_t;
 
 // Download, verify and flash the image, and mark it for the next boot —
@@ -36,6 +40,13 @@ void kp_ota_restart(void);
 // Identity of the running firmware.
 void kp_ota_get_app_desc(char* project, size_t project_size,
                          char* version, size_t version_size);
+
+// Device class reported to the cloud as `fw.class`: the hardware target the
+// firmware was built for (the chip on an MCU, e.g. "esp32s3"; the SoC or the
+// architecture on Linux, e.g. "tegra234"). It must be one of the classes the
+// platform knows, or the gateway closes the session. Static string; NULL or
+// empty leaves the class unreported.
+const char* kp_ota_get_device_class(void);
 
 // Persist / recall the update the device is rebooting into, so the core can
 // report `confirmed` or `rolled_back` on the next boot. Load returns 0 when

@@ -82,4 +82,40 @@ menu "Koios SDK Configuration"
 
     endif
 
+    config KOIOS_SDK_METRICS_ENABLE
+        bool "Report device metrics to Koios (over the cloudlink websocket)"
+        default n
+        help
+            Sample heap, task count, uptime, Wi-Fi signal strength and (once
+            per boot) the reset reason every interval, and send the samples
+            as a {"type":"metrics",...} control frame over the existing
+            cloudlink websocket. The gateway accepts it from devices whose
+            token carries `telemetry.write`, which is in the platform's
+            default capability set. Off by default; when disabled, no task
+            and no buffers are added. CPU load is included when FreeRTOS
+            run-time statistics are enabled
+            (CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS).
+
+    if KOIOS_SDK_METRICS_ENABLE
+
+        config KOIOS_SDK_METRICS_INTERVAL_S
+            int "Reporting interval (s)"
+            default 60
+            range 10 3600
+            help
+                Seconds between samples. The cloud can change it per device
+                through the twin: desired.koios.metrics.interval_s (0 stops
+                reporting).
+
+        config KOIOS_SDK_METRICS_BACKLOG
+            int "Samples kept while offline"
+            default 8
+            range 1 64
+            help
+                The newest samples wait in RAM while the session is down
+                (about 320 bytes each) and go out in one frame when it is
+                back; older ones are overwritten.
+
+    endif
+
 endmenu

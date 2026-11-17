@@ -1,5 +1,6 @@
 #include "koios/cloudlink.h"
 #include "koios/ota.h"
+#include "koios/metrics.h"
 
 #include "koios/port/kp_os.h"
 #include "koios/port/kp_log.h"
@@ -479,10 +480,10 @@ static void report_fw_identity(void) {
     char version[32] = { 0 };
     kp_ota_get_app_desc(project, sizeof(project), version, sizeof(version));
 
-    // Class is the silicon target, sourced from the build (never app-supplied)
-    // so a device can only ever claim its real chip. Project is the IDF project
-    // name; variant is the app-configured build variant. Both become device
-    // labels the platform can target OTA deployments on.
+    // Class is the silicon target, sourced from the port (never app-supplied)
+    // so a device can only ever claim its real chip. Project is the firmware
+    // project name; variant is the app-configured build variant. Both become
+    // device labels the platform can target OTA deployments on.
     cJSON* root = cJSON_CreateObject();
     if (!root) return;
     cJSON_AddStringToObject(root, "type", "twin.report");
@@ -490,7 +491,8 @@ static void report_fw_identity(void) {
     cJSON* state = cJSON_AddObjectToObject(root, "state");
     cJSON* fw = state ? cJSON_AddObjectToObject(state, "fw") : NULL;
     if (fw) {
-        cJSON_AddStringToObject(fw, "class", CONFIG_IDF_TARGET);
+        const char* dev_class = kp_ota_get_device_class();
+        if (dev_class && dev_class[0]) cJSON_AddStringToObject(fw, "class", dev_class);
         if (version[0]) cJSON_AddStringToObject(fw, "version", version);
         if (project[0]) cJSON_AddStringToObject(fw, "project", project);
         if (s.cfg.variant && s.cfg.variant[0]) {
@@ -608,6 +610,9 @@ static void handle_control_frame(const char* data, size_t len) {
                 (long long)cJSON_GetNumberValue(version));
             enqueue_text(ack);
         }
+        // Settings the SDK itself takes from the desired document (the
+        // metrics interval). No-op unless that module is running.
+        koios_metrics_on_twin_desired(cJSON_GetObjectItem(root, "desired"));
     }
     else if (strcmp(type, "twin.report.ack") == 0) {
         // Nothing to do.

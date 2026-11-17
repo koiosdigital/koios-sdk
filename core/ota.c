@@ -216,8 +216,8 @@ static check_result_t fetch_offer(const char* token, ota_offer_t* offer) {
             cJSON* size = cJSON_GetObjectItem(artifact, "size");
 
             if (update_id && version && art_url && sha256) {
-                strlcpy(offer->update_id, update_id, sizeof(offer->update_id));
-                strlcpy(offer->version, version, sizeof(offer->version));
+                snprintf(offer->update_id, sizeof(offer->update_id), "%s", update_id);
+                snprintf(offer->version, sizeof(offer->version), "%s", version);
                 offer->url = dup_string(art_url);
                 offer->sha256 = dup_string(sha256);
                 offer->size = cJSON_IsNumber(size)
@@ -262,6 +262,8 @@ static void apply_offer(const char* token, ota_offer_t* offer) {
         .bearer = auth,
         .sha256_hex = offer->sha256,
         .size = offer->size,
+        .version = offer->version,
+        .update_id = offer->update_id,
     };
 
     // The transfer can drop mid-stream (transient TLS/transport errors, a CDN

@@ -65,8 +65,9 @@ typedef struct {
     // Build variant, reported to the cloud as twin reported state `fw.variant`
     // on session ready — it becomes a device label the platform can target OTA
     // deployments on, e.g. "v9_64x32" (typically FIRMWARE_VARIANT). Reported
-    // alongside `fw.class` (the silicon target, sourced by the SDK from
-    // CONFIG_IDF_TARGET), `fw.project` (the IDF project name) and `fw.version`.
+    // alongside `fw.class` (the hardware target, from the port's
+    // kp_ota_get_device_class()), `fw.project` (the project name) and
+    // `fw.version`.
     // Optional; not copied — pass a string with static lifetime.
     const char* variant;
 
