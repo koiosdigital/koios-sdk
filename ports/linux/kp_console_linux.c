@@ -1,5 +1,7 @@
-// Console sessions on Linux: the session's WebSocket joined to a local TCP
-// address (console_stream.c does the work).
+// Console sessions on Linux: the session's WebSocket joined to the target the
+// device's configuration names: a local TCP address, a Unix socket, or a
+// program started for the session, such as koios-shell (console_stream.c does
+// the work).
 
 #include "koios/port/kp_console.h"
 #include "koios/port/kp_log.h"

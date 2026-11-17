@@ -123,8 +123,10 @@ static const char* apply(agent_config_t* c, const char* section, const char* key
         for (const char* p = name; *p; p++) {
             if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_') return "target names are letters, digits, - and _";
         }
-        if (!strchr(value, ':') || strlen(value) >= sizeof(c->console_targets[0].address)) {
-            return "expected host:port";
+        const bool path_kind = !strncmp(value, "unix:", 5) || !strncmp(value, "exec:", 5);
+        if (!strchr(value, ':') || (path_kind && value[5] != '/') ||
+            strlen(value) >= sizeof(c->console_targets[0].address)) {
+            return "expected host:port, unix:/path or exec:/path";
         }
         if (c->console_target_count >= AGENT_MAX_CONSOLE_TARGETS) return "too many console targets";
         agent_console_target_t* t = &c->console_targets[c->console_target_count++];

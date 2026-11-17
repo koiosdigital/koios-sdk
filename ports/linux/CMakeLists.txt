@@ -16,6 +16,7 @@ set(CMAKE_C_EXTENSIONS ON)
 
 option(KOIOS_BUILD_AGENT "Build the koios-agent daemon" ON)
 option(KOIOS_BUILD_TOOLS "Build koios-console, the operator's end of a console session" ON)
+option(KOIOS_BUILD_SHELL "Build koios-shell, a login shell on a terminal for console sessions" ON)
 option(KOIOS_BUILD_TESTS "Build the tests" ON)
 set(KOIOS_CJSON_DIR "" CACHE PATH "Directory with cJSON.c and cJSON.h (empty: use the system's libcjson)")
 
@@ -104,6 +105,18 @@ if(KOIOS_BUILD_TOOLS)
     target_link_libraries(koios-console PRIVATE koios_sdk)
     include(GNUInstallDirs)
     install(TARGETS koios-console RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+# koios-shell stands alone: no SDK, no TLS. The agent starts it for a session
+# (target.<name> = exec:<libexecdir>/koios/koios-shell) or a socket unit does.
+if(KOIOS_BUILD_SHELL)
+    add_executable(koios-shell tools/koios-shell.c)
+    if(NOT APPLE)
+        target_compile_definitions(koios-shell PRIVATE _GNU_SOURCE)
+    endif()
+    target_compile_options(koios-shell PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    include(GNUInstallDirs)
+    install(TARGETS koios-shell RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/koios)
 endif()
 
 if(KOIOS_BUILD_TESTS)

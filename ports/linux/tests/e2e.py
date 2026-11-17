@@ -33,6 +33,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -212,6 +213,53 @@ class Gateway:
         with self.send_lock:
             self._send(self.cloudlink, json.dumps(frame))
 
+    def _console_shell(self, conn, rec):
+        """The operator's end of a session to a shell: koios-shell's frames
+        (type, length, payload) inside the stream. Sends the terminal's size
+        and a command, and reads until the shell reports its exit."""
+        def frame(kind, payload=b""):
+            return struct.pack("!BI", kind, len(payload)) + payload
+        buf = b""
+        received = 0
+        rec["output"] = b""
+        try:
+            conn.settimeout(20)
+            self._send(conn, json.dumps({"type": "start", "target": "shell"}))
+            sent = False
+            while rec.get("status") is None:
+                opcode, data = self._recv_frame(conn)
+                if opcode == 0x8:
+                    break
+                if opcode == 0x9:
+                    self._send(conn, data, 0xA)
+                elif opcode == 0x1:
+                    msg = json.loads(data.decode())
+                    if msg.get("type") == "ready" and not sent:
+                        sent = True
+                        self._send(conn, frame(2, struct.pack("!HH", 120, 40)), 0x2)
+                        self._send(conn, frame(1, b"stty size; echo e2e-$((40+2)); exit 3\n"), 0x2)
+                    elif msg.get("type") == "error":
+                        rec["error"] = msg.get("reason")
+                        break
+                elif opcode == 0x2:
+                    buf += data
+                    received += len(data)
+                    self._send(conn, json.dumps({"type": "ack", "bytes": received}))
+                    while len(buf) >= 5:
+                        kind, length = struct.unpack("!BI", buf[:5])
+                        if len(buf) < 5 + length:
+                            break
+                        payload, buf = buf[5:5 + length], buf[5 + length:]
+                        if kind == 4:
+                            rec["hello"] = json.loads(payload.decode())
+                        elif kind == 1:
+                            rec["output"] += payload
+                        elif kind == 3:
+                            rec["status"] = struct.unpack("!i", payload)[0]
+            self._send(conn, struct.pack("!H", 1000), 0x8)
+        except (ConnectionError, OSError, ssl.SSLError, ValueError) as e:
+            rec["exception"] = repr(e)
+
     def _console_socket(self, conn, sid, request, cn):
         """The relay's side of a console session, with the test as the operator.
 
@@ -219,6 +267,10 @@ class Gateway:
         the device's target (an echo server) to send it back.
         """
         rec = self.console.setdefault(sid, {})
+        if rec.get("mode") == "shell":
+            self._console_shell(conn, rec)
+            rec["done"] = True
+            return
         rec["cn"] = cn
         rec["auth"] = [l.split(":", 1)[1].strip() for l in request.split("\r\n")
                        if l.lower().startswith("authorization:")]
@@ -474,7 +526,7 @@ class Ota:
 # The agent
 # ------------------------------------------------------------------------------
 
-def write_config(d, gw, ota, key, version, console_target=None, updates=True):
+def write_config(d, gw, ota, key, version, console_target=None, updates=True, more_targets=None):
     with open(f"{d}/os-release", "w") as f:
         f.write(f'ID=luka\nVERSION_ID="{version}"\nVARIANT_ID=zedbox2-orin-nx\nPRETTY_NAME="Test OS {version}"\n')
     with open(f"{d}/facts.json", "w") as f:
@@ -529,6 +581,8 @@ restart_cmd = {d}/restart.sh
 enabled = yes
 target.echo = {console_target}
 """
+        for name, address in (more_targets or {}).items():
+            conf += f"target.{name} = {address}\n"
     with open(f"{d}/agent.conf", "w") as f:
         f.write(conf)
 
@@ -543,6 +597,7 @@ def main():
     ap.add_argument("--agent", required=True)
     ap.add_argument("--scratch", required=True)
     ap.add_argument("--pkcs11", action="store_true")
+    ap.add_argument("--shell", help="koios-shell: also run a console session to a shell")
     args = ap.parse_args()
 
     d = os.path.abspath(args.scratch)
@@ -691,8 +746,41 @@ def main():
             threading.Thread(target=serve, daemon=True).start()
     threading.Thread(target=echo_loop, daemon=True).start()
 
+    # The same echo service behind a Unix socket, and a shell the agent starts.
+    # A socket's path is short by nature (about 100 bytes): not under the scratch directory.
+    unix_dir = tempfile.mkdtemp(prefix="koios-e2e-", dir="/tmp")
+    unix_path = f"{unix_dir}/echo.sock"
+    uecho = socket.socket(socket.AF_UNIX)
+    uecho.bind(unix_path)
+    uecho.listen(4)
+
+    def unix_echo_loop():
+        while True:
+            try:
+                c, _ = uecho.accept()
+            except OSError:
+                return
+
+            def serve(c=c):
+                try:
+                    while True:
+                        data = c.recv(65536)
+                        if not data:
+                            break
+                        c.sendall(data)
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+            threading.Thread(target=serve, daemon=True).start()
+    threading.Thread(target=unix_echo_loop, daemon=True).start()
+    more = {"unixecho": f"unix:{unix_path}"}
+    if args.shell:
+        more["shell"] = f"exec:{os.path.abspath(args.shell)} --shell /bin/sh"
+
     gw3 = Gateway(d)
-    write_config(d, gw3, ota, key, "2.0.0", console_target=f"127.0.0.1:{echo.getsockname()[1]}", updates=False)
+    write_config(d, gw3, ota, key, "2.0.0", console_target=f"127.0.0.1:{echo.getsockname()[1]}", updates=False,
+                 more_targets=more)
     proc = start_agent(args.agent, d, env, "agent-4.log")
     wait_for(lambda: gw3.sessions >= 1 and any("fw" in f.get("state", {}) for f in gw3.of_type("twin.report")),
              15, "session up")
@@ -708,6 +796,27 @@ def main():
     acks = rec.get("acks") or []
     check(acks and acks == sorted(acks) and acks[-1] >= rec.get("payload_len", 0) - 32768,
           f"it acknowledges what it wrote to the target ({len(acks)} acks, last {acks[-1] if acks else None})")
+
+    sid_u = str(uuid.uuid4())
+    gw3.push({"type": "console.open", "session": sid_u, "target": "unixecho", "by": "someone@example.com"})
+    wait_for(lambda: gw3.console.get(sid_u, {}).get("done"), 30, "a session to a Unix-socket target")
+    rec = gw3.console.get(sid_u, {})
+    check(rec.get("ready") and rec.get("echo_ok"),
+          f"200 kB go through the Unix socket and come back intact ({rec.get('exception', 'no error')})")
+    wait_for(lambda: any("opening for someone@example.com" in l["message"]
+                         for f in gw3.of_type("logs") for l in f["logs"]), 10,
+             "the device's own log names who opened the session")
+
+    if args.shell:
+        sid_s = str(uuid.uuid4())
+        gw3.console[sid_s] = {"mode": "shell"}
+        gw3.push({"type": "console.open", "session": sid_s, "target": "shell"})
+        wait_for(lambda: gw3.console.get(sid_s, {}).get("done"), 30, "a session to a shell the agent starts")
+        rec = gw3.console.get(sid_s, {})
+        check(rec.get("hello", {}).get("shell") == "/bin/sh", f"koios-shell says hello ({rec.get('hello')})")
+        check(b"e2e-42" in rec.get("output", b"") and b"40 120" in rec.get("output", b""),
+              "a command typed by the operator runs on a terminal of the size the operator sent")
+        check(rec.get("status") == 3, f"the shell's exit status comes back ({rec.get('status')}, {rec.get('exception', 'no error')})")
 
     sid2 = str(uuid.uuid4())
     gw3.push({"type": "console.open", "session": sid2, "target": "nosuch"})
@@ -735,6 +844,7 @@ def main():
     proc.wait(timeout=20)
     check(proc.returncode == 0, "stops cleanly")
 
+    shutil.rmtree(unix_dir, ignore_errors=True)
     if failures:
         print(f"\n{len(failures)} check(s) failed; agent logs are in {d}")
         for name in ("agent-1.log", "agent-2.log", "agent-3.log", "agent-4.log", "agent-5.log"):

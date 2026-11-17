@@ -41,7 +41,7 @@ the device key in a PKCS#11 token (SoftHSM behind OpenSSL's pkcs11 provider).
 | `kp_websocket` | a client written on OpenSSL (RFC 6455), one thread per connection |
 | `kp_ota` | downloads to a staging directory, checks size and SHA-256, runs the system's installer. Never writes a partition |
 | `kp_metrics` | `/proc` and `/sys` |
-| `kp_console` | the session's WebSocket joined to a local TCP address (`console_stream.c`) |
+| `kp_console` | the session's WebSocket joined to a target: a local TCP address, a Unix socket, or a program started for the session (`console_stream.c`) |
 
 Two things differ from an MCU on purpose:
 
@@ -129,7 +129,8 @@ restart_cmd =
 
 [console]
 enabled = no
-target.ssh = 127.0.0.1:22        # the only addresses the device will ever connect a session to
+target.shell = exec:/usr/libexec/koios/koios-shell   # what a session may be joined to, by name:
+                                                     # host:port, unix:/path or exec:/path args
 ```
 
 ## What it reports
@@ -181,38 +182,102 @@ stays behind its outbound link. Off by default:
 ```ini
 [console]
 enabled = yes
-target.ssh = 127.0.0.1:22
+target.shell = exec:/usr/libexec/koios/koios-shell
 ```
 
-A target is a name and a local TCP address. The gateway asks for a target by
-name (`console.open` on cloudlink); the agent joins a session only to an
-address this file lists, and refuses anything else at once
-(`console.status`). The cloud never names an address.
+A target is a name and what a session to it is joined to on this machine:
+
+| Value | The session's far end |
+|---|---|
+| `host:port` | a TCP connection, for instance to a service on the machine |
+| `unix:/path` | a Unix stream socket, for instance one a socket unit listens on |
+| `exec:/path arg …` | a program started for the session, with the stream as its standard input and output (arguments are split at spaces) |
+
+The gateway asks for a target by name (`console.open` on cloudlink); the agent
+joins a session only to what this file lists under that name, and refuses
+anything else at once (`console.status`). The cloud never names an address or
+a program. The agent's log names who opened each session, as the gateway says.
 
 For each session the agent opens a second WebSocket, to the gateway it is
 already connected to and nowhere else
 (`<cloud url>/v1/console/sessions/<id>/device`), with its device token and, on
 an mTLS gateway, its certificate. It connects the target only when the gateway
-says the operator is there. With `target.ssh` pointing at the machine's own
-sshd, the stream is SSH between the operator's client and that sshd: the
-gateway relays bytes it cannot read, and whether anyone gets a shell is still
-decided by sshd alone.
+says the operator is there.
 
 Three switches have to be on for a session to exist: the operator's
 `iot.console` permission, the `console` capability on the device's fleet, and
 this section. At most 4 sessions run at a time.
 
-### `koios-console`, the operator's end
+### `shell`: the terminal in the Koios console
+
+The target named `shell` is the one the console's Console tab asks for.
+`koios-shell` is its far end: a login shell on a pseudo-terminal, as the user
+`koios-shell` runs as. The browser is the terminal; nothing is installed on
+the operator's machine. **Whoever may open a session gets that shell without
+any further login on the device**: the three switches above are all that
+stands between a person in Koios and a prompt, and the stream is readable by
+the gateway. Give the shell's user what an operator should have, and no more.
+
+Two ways to run it:
+
+- `target.shell = exec:/usr/libexec/koios/koios-shell`: the agent starts it,
+  so the shell runs as the agent's user and inside whatever confines the
+  agent. Right for a machine where the agent is not sandboxed.
+- `target.shell = unix:/run/koios-console/shell.sock`, with the service
+  manager listening on that socket and starting `koios-shell` per connection
+  as the user of its choice. The agent stays an unprivileged, sandboxed
+  service and only needs to be able to connect to the socket. With systemd:
+
+  ```ini
+  # koios-console.socket
+  [Socket]
+  ListenStream=/run/koios-console/shell.sock
+  SocketUser=koios          # the agent's user: nobody else can connect
+  SocketMode=0600
+  Accept=yes
+  MaxConnections=4
+
+  # koios-console@.service
+  [Service]
+  ExecStart=/usr/libexec/koios/koios-shell
+  User=operator             # who a console session is
+  StandardInput=socket
+  StandardOutput=socket
+  StandardError=journal
+  ```
+
+Started as root, `koios-shell --user NAME` becomes that user itself.
+`--shell PATH` runs another shell than the user's own.
+
+Inside the session's stream `koios-shell` and the terminal exchange frames:
+one byte of type, four of length (big-endian), the payload.
+
+| | Type | Payload |
+|---|---|---|
+| to the shell | 1 data | what was typed |
+| | 2 resize | columns, rows (two bytes each, big-endian) |
+| from the shell | 4 hello | `{"user","host","shell"}` as JSON; once, first |
+| | 1 data | what the terminal shows |
+| | 3 exit | the shell's exit status (four bytes, big-endian) |
+
+When the stream ends the terminal hangs up: the shell and what it started get
+SIGHUP.
+
+### Other targets and `koios-console`
+
+A target that is not a shell is a plain byte stream to a service on the
+machine, for a client of the operator's own. `koios-console attach
+<operator-url> <ticket>` joins such a session to stdin and stdout on the
+operator's machine (`-DKOIOS_BUILD_TOOLS=ON`, the default; Linux and macOS);
+the ticket works once and for a few minutes, and may be given in
+`KOIOS_CONSOLE_TICKET`. With `target.ssh = 127.0.0.1:22` and
 
 ```sh
 ssh -o ProxyCommand='koios-console attach <operator-url> <ticket>' user@device
 ```
 
-`koios-console attach` joins the session to stdin and stdout. The URL and the
-ticket come from the Koios console (device page, Console tab, New session);
-the ticket works once and for a few minutes, and may be given in
-`KOIOS_CONSOLE_TICKET` instead of on the command line. It builds from the same
-tree (`-DKOIOS_BUILD_TOOLS=ON`, the default) on Linux and macOS.
+the stream is SSH between the operator's client and the machine's own sshd:
+the gateway relays bytes it cannot read, and sshd alone decides who gets in.
 
 The two ends do flow control between themselves (`console_stream.h`): an end
 sends at most 256 KiB beyond what the other has acknowledged writing out, so
@@ -226,8 +291,11 @@ the relay never holds more than that, however large the copy.
 | `logstore_*` | ring order, eviction, consume after an eviction, survival across two processes |
 | `metrics` | the `/proc` and `/sys` parsers against fixtures |
 | `websocket` | framing both ways against a scripted server (three length forms, fragments, a ping between fragments, bytes one at a time, the size bound), and how each kind of failure is classified |
-| `agent_e2e` | the agent binary against a mock gateway with mutual TLS and a mock OTA service: gate on the provisioned marker, a three-level chain completed from `extra_chain`, twin reports, the metrics interval from the desired twin, log shipping, an update through a fake installer with a resumed download, confirmation after the restart, reconnect after the gateway closes the session, and console sessions (the session socket with certificate and token, a target connected only on `start`, 200 kB to an echo target and back, acknowledgements, refusal of an unknown target and of everything when console is off) |
+| `agent_e2e` | the agent binary against a mock gateway with mutual TLS and a mock OTA service: gate on the provisioned marker, a three-level chain completed from `extra_chain`, twin reports, the metrics interval from the desired twin, log shipping, an update through a fake installer with a resumed download, confirmation after the restart, reconnect after the gateway closes the session, and console sessions (the session socket with certificate and token, a target connected only on `start`, 200 kB to an echo target and back, acknowledgements, the same through a Unix-socket target, a session to a shell the agent starts (the terminal's size, a command, the exit status), the opener's name in the device's log, refusal of an unknown target and of everything when console is off) |
+| `shell` | `koios-shell` by itself: hello, a command on a terminal of the size sent, a resize, an unknown frame skipped, the exit status, a killed shell, the hang-up when the stream ends, a shell or a user that does not exist |
 
 The console was also run for real against the gateway's own code (`koios-sh-vn`
 and `koios-sh-iot-api` under `wrangler dev`): `ssh` through `koios-console`,
-the relay and the agent to an sshd, 40 MB each way with checksums.
+the relay and the agent to an sshd, 40 MB each way with checksums; and the
+Koios console's terminal in a browser through the relay and the agent to
+`koios-shell` (commands, 120 000 lines of output, a resize, the exit status).

@@ -44,8 +44,9 @@ static void refuse(const char* session, const char* reason) {
 #define DEFAULT_MAX_SESSIONS 4
 #define MAX_TARGETS          8
 #define TARGET_NAME_LEN      24
-#define TARGET_ADDRESS_LEN   96
+#define TARGET_ADDRESS_LEN   256
 #define URL_LEN              320
+#define BY_LEN               80
 #define TASK_STACK_BYTES     8192
 #define TASK_PRIORITY        4
 
@@ -69,6 +70,7 @@ typedef struct {
     char url[URL_LEN];
     char target_name[TARGET_NAME_LEN];
     char target_address[TARGET_ADDRESS_LEN];
+    char by[BY_LEN];  // who opened it, as the gateway says; for this device's own log
     char* token;  // kp_malloc'd
 } job_t;
 
@@ -82,7 +84,8 @@ static void session_task(void* arg) {
         .target_name = job->target_name,
         .target_address = job->target_address,
     };
-    KP_LOGI(TAG, "Console session %s to '%s' opening", job->session_id, job->target_name);
+    KP_LOGI(TAG, "Console session %s to '%s' opening for %s", job->session_id, job->target_name,
+        job->by[0] ? job->by : "(not named)");
     const int rc = kp_console_run(&session);
     if (rc == 0) KP_LOGI(TAG, "Console session %s ended", job->session_id);
     else KP_LOGW(TAG, "Console session %s did not start", job->session_id);
@@ -156,6 +159,13 @@ void koios_console_on_open(const struct cJSON* frame) {
     snprintf(job->session_id, sizeof(job->session_id), "%s", session);
     snprintf(job->target_name, sizeof(job->target_name), "%s", found->name);
     snprintf(job->target_address, sizeof(job->target_address), "%s", found->address);
+    // The name goes into a log line: printable characters only.
+    const char* by = cJSON_GetStringValue(cJSON_GetObjectItem(frame, "by"));
+    size_t n = 0;
+    for (; by && *by && n + 1 < sizeof(job->by); by++) {
+        if (*by > 0x20 && *by < 0x7f) job->by[n++] = *by;
+    }
+    job->by[n] = '\0';
     snprintf(job->url, sizeof(job->url), "%s/v1/console/sessions/%s/device", s.url, session);
 
     if (!kp_task_spawn("koios_console", session_task, job, TASK_STACK_BYTES, TASK_PRIORITY)) {

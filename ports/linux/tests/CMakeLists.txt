@@ -41,12 +41,21 @@ add_test(NAME metrics COMMAND test_metrics ${TEST_SCRATCH}/metrics)
 add_test(NAME websocket COMMAND test_ws)
 set_tests_properties(websocket PROPERTIES TIMEOUT 120)
 
+find_package(Python3 COMPONENTS Interpreter)
+
+# koios-shell by itself: a terminal, its size, the exit status, the hang-up.
+if(KOIOS_BUILD_SHELL AND Python3_FOUND)
+    add_test(NAME shell
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/shell_test.py --shell $<TARGET_FILE:koios-shell>)
+    set_tests_properties(shell PROPERTIES TIMEOUT 60)
+endif()
+
 if(KOIOS_BUILD_AGENT)
-    find_package(Python3 COMPONENTS Interpreter)
     if(Python3_FOUND)
         add_test(NAME agent_e2e
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/e2e.py
-                --agent $<TARGET_FILE:koios-agent> --scratch ${TEST_SCRATCH}/e2e)
+                --agent $<TARGET_FILE:koios-agent> --scratch ${TEST_SCRATCH}/e2e
+                $<$<BOOL:${KOIOS_BUILD_SHELL}>:--shell> $<$<BOOL:${KOIOS_BUILD_SHELL}>:$<TARGET_FILE:koios-shell>>)
         set_tests_properties(agent_e2e PROPERTIES TIMEOUT 180)
     endif()
 endif()

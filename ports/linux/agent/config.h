@@ -17,7 +17,7 @@
 
 typedef struct {
     char name[24];
-    char address[96];  // host:port on this device
+    char address[256];  // host:port on this device, unix:/path or exec:/path with arguments
 } agent_console_target_t;
 
 typedef struct {

@@ -156,9 +156,10 @@ An operator can reach a device through the gateway while the device stays
 behind its outbound link (`include/koios/console.h`). The gateway asks with a
 `console.open` control frame naming a **target**; the device joins the session
 only to a target its own configuration lists, over a second WebSocket it opens
-for that session to the gateway it is already connected to. On Linux a target
-is a local TCP address, typically the machine's own sshd, so the session is
-SSH end to end and the gateway relays bytes it cannot read
+for that session to the gateway it is already connected to. On Linux the
+target `shell` is a login shell on a terminal (`koios-shell`), which the
+Console tab of the Koios console opens in the browser; other targets are a
+local TCP address, a Unix socket or a program, as plain byte streams
 ([docs/linux.md](docs/linux.md)).
 
 The ESP-IDF port has no console yet. A device without it answers

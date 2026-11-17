@@ -2,7 +2,8 @@
 
 // One end of a console session: a WebSocket to the gateway's relay on one
 // side, a local byte stream on the other. Used by both ends: the device
-// (koios-agent: the local stream is a TCP connection to one of its targets)
+// (koios-agent: the local stream is one of its targets: a TCP connection, a
+// Unix socket or a program it starts, see connect_target in console_stream.c)
 // and the operator (koios-console: the local stream is stdin and stdout, for
 // ssh's ProxyCommand).
 //
@@ -39,7 +40,7 @@ typedef struct {
     const char* protocols;  // operator: "koios.console.v1, ticket.<ticket>"
     bool present_identity;  // device, on an mTLS gateway: show the certificate too
 
-    const char* target_address;  // device: "host:port", connected when told to start
+    const char* target_address;  // device: host:port, unix:/path or exec:/path; connected when told to start
     int in_fd;                   // operator: the local stream (stdin, stdout)
     int out_fd;
 } ks_config_t;

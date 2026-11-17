@@ -17,10 +17,11 @@
 //
 //   {"type":"console.status","session":"<uuid>","state":"refused","reason":"..."}
 //
-// On Linux a target is a local TCP address, typically the machine's own sshd:
-// the stream is then SSH end to end between the operator's client and that
-// sshd, and the gateway relays bytes it cannot read. What a session is joined
-// to is the port's business (port/kp_console.h).
+// On Linux a target is a local TCP address, a Unix socket or a program started
+// for the session. The target named `shell` is a login shell on a terminal
+// (koios-shell), which the Koios console's terminal opens in the browser; any
+// other is a plain byte stream to a service on the device (docs/linux.md).
+// What a session is joined to is the port's business (port/kp_console.h).
 //
 // Off unless the build defines CONFIG_KOIOS_SDK_CONSOLE_ENABLE and the
 // application calls koios_console_init(). A device without it refuses every
@@ -36,7 +37,7 @@ extern "C" {
 
 typedef struct {
     const char* name;     // what the cloud may ask for: [a-z0-9_-], e.g. "ssh"
-    const char* address;  // what it means here; on Linux "host:port"
+    const char* address;  // what it means here; on Linux host:port, unix:/path or exec:/path
 } koios_console_target_t;
 
 typedef struct {

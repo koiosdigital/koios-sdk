@@ -14,11 +14,17 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char** environ;
 
 static const char* TAG = "console";
 
@@ -37,6 +43,7 @@ typedef struct {
 
     int in_fd, out_fd;
     bool own_fds;    // device: both are the target's socket, closed here
+    pid_t target_pid;  // device, an exec: target: the program started for the session
 
     // local -> gateway
     unsigned long long sent, acked;
@@ -119,7 +126,7 @@ static void start_stream(ks_t* k) {
 }
 
 // "host:port" -> a connected socket, or -1.
-static int connect_target(const char* address) {
+static int connect_tcp(const char* address) {
     char host[96];
     const char* colon = strrchr(address, ':');
     if (!colon || colon == address || (size_t)(colon - address) >= sizeof(host)) return -1;
@@ -155,9 +162,6 @@ static int connect_target(const char* address) {
             fcntl(s, F_SETFL, flags);  // blocking again: the pumps block on it
             int one = 1;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-#if defined(SO_NOSIGPIPE)
-            setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-#endif
             fd = s;
         }
         else {
@@ -166,6 +170,89 @@ static int connect_target(const char* address) {
     }
     freeaddrinfo(list);
     return fd;
+}
+
+// "/path" -> a connected Unix stream socket, or -1.
+static int connect_unix(const char* path) {
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    if (strlen(path) >= sizeof(addr.sun_path)) return -1;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    const int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    fcntl(s, F_SETFD, FD_CLOEXEC);
+    if (connect(s, (const struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+// "/path/to/program arg ..." -> one end of a socket pair whose other end is
+// the program's standard input and output, or -1. Arguments are split at
+// spaces; there is no quoting.
+static int spawn_target(const char* command, pid_t* pid_out) {
+    char line[256];
+    if (strlen(command) >= sizeof(line)) return -1;
+    snprintf(line, sizeof(line), "%s", command);
+    char* argv[16];
+    int argc = 0;
+    char* save = NULL;
+    for (char* word = strtok_r(line, " ", &save); word && argc < 15; word = strtok_r(NULL, " ", &save)) {
+        argv[argc++] = word;
+    }
+    argv[argc] = NULL;
+    if (argc == 0 || argv[0][0] != '/') return -1;
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    fcntl(sv[0], F_SETFD, FD_CLOEXEC);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, sv[1], 0);
+    posix_spawn_file_actions_adddup2(&actions, sv[1], 1);
+    if (sv[1] > 2) posix_spawn_file_actions_addclose(&actions, sv[1]);
+    pid_t pid = 0;
+    const int rc = posix_spawn(&pid, argv[0], &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(sv[1]);
+    if (rc != 0) {
+        close(sv[0]);
+        return -1;
+    }
+    *pid_out = pid;
+    return sv[0];
+}
+
+// The device's end of the stream, from the target's address in the device's
+// own configuration:
+//
+//   host:port         a TCP connection (an sshd, a service on this device)
+//   unix:/path        a Unix stream socket (a socket-activated service)
+//   exec:/path arg…   a program started for this session, with the stream as
+//                     its standard input and output
+static int connect_target(const char* address, pid_t* pid_out) {
+    int fd;
+    if (strncmp(address, "unix:", 5) == 0) fd = connect_unix(address + 5);
+    else if (strncmp(address, "exec:", 5) == 0) fd = spawn_target(address + 5, pid_out);
+    else fd = connect_tcp(address);
+#if defined(SO_NOSIGPIPE)
+    if (fd >= 0) {
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+    }
+#endif
+    return fd;
+}
+
+// An exec: target's program has lost its stream and ends by itself; make sure.
+static void reap_target(pid_t pid) {
+    int status;
+    for (int i = 0; i < 150; i++) {  // 3 s
+        if (waitpid(pid, &status, WNOHANG) != 0) return;
+        usleep(20 * 1000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
 }
 
 static void send_text(ks_t* k, const char* json) {
@@ -195,7 +282,7 @@ static void on_text(ks_t* k, const uint8_t* data, size_t len) {
         // gives a silent client two minutes, and the operator may take longer
         // than that to arrive.
         if (!k->started) {
-            const int fd = connect_target(k->cfg.target_address);
+            const int fd = connect_target(k->cfg.target_address, &k->target_pid);
             if (fd < 0) {
                 send_text(k, "{\"type\":\"error\",\"reason\":\"the device could not connect to its target\"}");
                 finish(k, "could not connect to the target");
@@ -305,6 +392,7 @@ int ks_run(const ks_config_t* cfg, char* reason, size_t reason_size) {
     if (k->ws) kp_ws_close_bounded(k->ws, 5000);
     if (k->reader_started && k->own_fds) pthread_join(k->reader, NULL);
     if (k->own_fds && k->in_fd >= 0) close(k->in_fd);
+    if (k->target_pid > 0) reap_target(k->target_pid);
 
     if (reason && reason_size) snprintf(reason, reason_size, "%s", k->reason);
     if (cert) kp_free(cert);
