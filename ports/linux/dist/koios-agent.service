@@ -1,0 +1,20 @@
+[Unit]
+Description=Koios agent: cloud session, logs, metrics
+Documentation=https://github.com/koiosdigital/koios-sdk/blob/main/docs/linux.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/koios-agent -c /etc/koios/agent.conf
+# The SDK's last resort after hours without a session is to exit with status
+# 75; either way the agent comes back.
+Restart=always
+RestartSec=5
+WatchdogSec=120
+StateDirectory=koios
+RuntimeDirectory=koios
+RuntimeDirectoryPreserve=restart
+
+[Install]
+WantedBy=multi-user.target
