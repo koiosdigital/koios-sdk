@@ -460,8 +460,12 @@ void kp_system_restart(void) {
         s_cfg.restart_handler();
         return;
     }
+    // _exit, not exit: this runs on one of the SDK's threads while the others
+    // are still inside OpenSSL and libcurl, and exit() would run their
+    // library teardown under them. The log ring is a shared mapping and needs
+    // no flush; stdio does.
     fflush(NULL);
-    exit(KOIOS_LINUX_EXIT_RESTART);
+    _exit(KOIOS_LINUX_EXIT_RESTART);
 }
 
 //------------------------------------------------------------------------------

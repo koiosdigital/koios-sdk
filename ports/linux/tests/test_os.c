@@ -7,6 +7,7 @@
 
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static atomic_int s_fired;
@@ -84,6 +85,18 @@ int main(int argc, char** argv) {
         CHECK_EQ(kp_persist_get(1), 0);
         CHECK_EQ(kp_persist_get(99), 0);
     }
+
+    // "Restart the device" ends this process with the status its supervisor
+    // restarts on, and nothing else: no reboot, no signal.
+    const pid_t child = fork();
+    if (child == 0) {
+        kp_system_restart();
+        _exit(1);  // not reached
+    }
+    int status = 0;
+    CHECK(child > 0 && waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), KOIOS_LINUX_EXIT_RESTART);
 
     CHECK(kp_random() != kp_random() || kp_random() != kp_random());
     CHECK(kp_wall_time_s() > 1600000000);
