@@ -9,6 +9,7 @@
 #include "journal.h"
 
 #include "koios/cloudlink.h"
+#include "koios/console.h"
 #include "koios/linux.h"
 #include "koios/logship.h"
 #include "koios/metrics.h"
@@ -352,6 +353,20 @@ int main(int argc, char** argv) {
     if (s_cfg.metrics) {
         const koios_metrics_config_t metrics = { .interval_s = s_cfg.metrics_interval_s };
         koios_metrics_init(&metrics);
+    }
+    if (s_cfg.console) {
+        koios_console_target_t targets[AGENT_MAX_CONSOLE_TARGETS];
+        for (size_t i = 0; i < s_cfg.console_target_count; i++) {
+            targets[i].name = s_cfg.console_targets[i].name;
+            targets[i].address = s_cfg.console_targets[i].address;
+        }
+        const koios_console_config_t console = {
+            .url = s_cfg.url,
+            .mtls = s_cfg.mtls,
+            .targets = targets,
+            .target_count = s_cfg.console_target_count,
+        };
+        koios_console_init(&console);
     }
     if (s_cfg.logs && s_cfg.journal) {
         agent_journal_start(s_cfg.state_dir, s_cfg.journal_priority, s_cfg.journal_backlog);

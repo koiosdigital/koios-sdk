@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 IMAGE = bytes((i * 7 + 3) & 0xFF for i in range(300_000))
@@ -183,6 +184,9 @@ class Gateway:
         self.peer_cns = []
         self.lock = threading.Lock()
         self.close_first_session_after = None
+        self.cloudlink = None      # the newest cloudlink socket, for frames the test pushes
+        self.send_lock = threading.Lock()
+        self.console = {}          # session id -> what the device's session socket did
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(f"{d}/server.pem", f"{d}/server.key")
         ctx.verify_mode = ssl.CERT_REQUIRED
@@ -202,6 +206,62 @@ class Gateway:
             except OSError:
                 return
             threading.Thread(target=self._serve, args=(raw,), daemon=True).start()
+
+    def push(self, frame):
+        """Send a control frame on the device's cloudlink socket, as the gateway would."""
+        with self.send_lock:
+            self._send(self.cloudlink, json.dumps(frame))
+
+    def _console_socket(self, conn, sid, request, cn):
+        """The relay's side of a console session, with the test as the operator.
+
+        Tells the device to start, waits for `ready`, sends a payload and expects
+        the device's target (an echo server) to send it back.
+        """
+        rec = self.console.setdefault(sid, {})
+        rec["cn"] = cn
+        rec["auth"] = [l.split(":", 1)[1].strip() for l in request.split("\r\n")
+                       if l.lower().startswith("authorization:")]
+        payload = bytes((i * 13 + 5) & 0xFF for i in range(200_000))
+        echoed = bytearray()
+        acks = []
+        try:
+            conn.settimeout(20)
+            self._send(conn, json.dumps({"type": "start", "target": "echo"}))
+            ready = False
+            sent = False
+            while len(echoed) < len(payload):
+                opcode, data = self._recv_frame(conn)
+                if opcode == 0x8:
+                    break
+                if opcode == 0x9:
+                    self._send(conn, data, 0xA)
+                elif opcode == 0x1:
+                    msg = json.loads(data.decode())
+                    if msg.get("type") == "ready":
+                        ready = True
+                    elif msg.get("type") == "ack":
+                        acks.append(msg.get("bytes"))
+                    elif msg.get("type") == "error":
+                        rec["error"] = msg.get("reason")
+                        break
+                elif opcode == 0x2:
+                    echoed += data
+                    # Acknowledge what came back, as an operator's end does.
+                    self._send(conn, json.dumps({"type": "ack", "bytes": len(echoed)}))
+                if ready and not sent:
+                    sent = True
+                    for i in range(0, len(payload), 16384):
+                        self._send(conn, payload[i:i + 16384], 0x2)
+            rec["ready"] = ready
+            rec["echo_ok"] = bytes(echoed) == payload
+            rec["acks"] = acks
+            rec["payload_len"] = len(payload)
+            self._send(conn, struct.pack("!H", 1000), 0x8)
+        except (ConnectionError, OSError, ssl.SSLError, ValueError) as e:
+            rec["exception"] = repr(e)
+        finally:
+            rec["done"] = True
 
     @staticmethod
     def _send(conn, text, opcode=0x1):
@@ -258,11 +318,17 @@ class Gateway:
             accept = base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
             conn.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                           f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+            path = req.decode().split(" ")[1]
+            if path.startswith("/v1/console/sessions/") and path.endswith("/device"):
+                self._console_socket(conn, path.split("/")[4], req.decode(), cn)
+                return
             with self.lock:
                 self.sessions += 1
                 session = self.sessions
                 self.peer_cns.append(cn)
+                self.cloudlink = conn
 
+            self.send_lock.acquire()
             self._send(conn, json.dumps({
                 "type": "welcome", "device_id": "11111111-2222-3333-4444-555555555555",
                 "token": "test.device.token", "expires_at": int(time.time()) + 900,
@@ -270,6 +336,7 @@ class Gateway:
             self._send(conn, json.dumps({
                 "type": "twin.desired", "version": 3,
                 "desired": {"koios": {"metrics": {"interval_s": 10}}}}))
+            self.send_lock.release()
 
             count = 0
             while True:
@@ -283,7 +350,8 @@ class Gateway:
                     continue
                 text = data.decode()
                 if text == "ping":
-                    self._send(conn, "pong")
+                    with self.send_lock:
+                        self._send(conn, "pong")
                     continue
                 try:
                     frame = json.loads(text)
@@ -293,7 +361,8 @@ class Gateway:
                     self.frames.append((session, frame))
                 count += 1
                 if isinstance(frame, dict) and frame.get("type") == "twin.report":
-                    self._send(conn, json.dumps({"type": "twin.report.ack", "version": count}))
+                    with self.send_lock:
+                        self._send(conn, json.dumps({"type": "twin.report.ack", "version": count}))
                 if session == 1 and self.close_first_session_after and count >= self.close_first_session_after:
                     self._send(conn, struct.pack("!H", 1001) + b"going away", 0x8)
                     time.sleep(0.2)
@@ -405,7 +474,7 @@ class Ota:
 # The agent
 # ------------------------------------------------------------------------------
 
-def write_config(d, gw, ota, key, version):
+def write_config(d, gw, ota, key, version, console_target=None, updates=True):
     with open(f"{d}/os-release", "w") as f:
         f.write(f'ID=luka\nVERSION_ID="{version}"\nVARIANT_ID=zedbox2-orin-nx\nPRETTY_NAME="Test OS {version}"\n')
     with open(f"{d}/facts.json", "w") as f:
@@ -448,11 +517,17 @@ interval_s = 3600
 storage_path = {d}
 
 [ota]
-enabled = yes
+enabled = {"yes" if updates else "no"}
 endpoint = https://localhost:{ota.port}
 staging_dir = {d}/staging
 apply_cmd = {d}/install.sh
 restart_cmd = {d}/restart.sh
+"""
+    if console_target:
+        conf += f"""
+[console]
+enabled = yes
+target.echo = {console_target}
 """
     with open(f"{d}/agent.conf", "w") as f:
         f.write(conf)
@@ -563,7 +638,8 @@ def main():
     proc = start_agent(args.agent, d, env, "agent-2.log")
     wait_for(lambda: gw.sessions > sessions_before, 15, "connects again")
     wait_for(lambda: "confirmed" in [s.get("status") for s in ota.statuses], 40, "confirms the update after the restart")
-    check(not os.path.exists(f"{d}/state/ota_pending"), "the pending record is cleared")
+    # The agent clears it once the report's answer is in, a moment after the mock saw the report.
+    wait_for(lambda: not os.path.exists(f"{d}/state/ota_pending"), 5, "the pending record is cleared")
     with gw.lock:
         new_frames = [f for _, f in gw.frames[frames_before:] if isinstance(f, dict)]
     check(any(f.get("type") == "twin.report" and f.get("state", {}).get("fw", {}).get("version") == "2.0.0"
@@ -588,9 +664,80 @@ def main():
     proc.wait(timeout=20)
     check(proc.returncode == 0, "stops cleanly")
 
+    print("phase 6: console sessions")
+    echo = socket.socket()
+    echo.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    echo.bind(("127.0.0.1", 0))
+    echo.listen(4)
+
+    def echo_loop():
+        while True:
+            try:
+                c, _ = echo.accept()
+            except OSError:
+                return
+
+            def serve(c=c):
+                try:
+                    while True:
+                        data = c.recv(65536)
+                        if not data:
+                            break
+                        c.sendall(data)
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+            threading.Thread(target=serve, daemon=True).start()
+    threading.Thread(target=echo_loop, daemon=True).start()
+
+    gw3 = Gateway(d)
+    write_config(d, gw3, ota, key, "2.0.0", console_target=f"127.0.0.1:{echo.getsockname()[1]}", updates=False)
+    proc = start_agent(args.agent, d, env, "agent-4.log")
+    wait_for(lambda: gw3.sessions >= 1 and any("fw" in f.get("state", {}) for f in gw3.of_type("twin.report")),
+             15, "session up")
+
+    sid = str(uuid.uuid4())
+    gw3.push({"type": "console.open", "session": sid, "target": "echo"})
+    wait_for(lambda: gw3.console.get(sid, {}).get("done"), 30, "the device opens the session's own socket")
+    rec = gw3.console.get(sid, {})
+    check(rec.get("cn") == "luka-test-unit" and rec.get("auth") == ["Bearer test.device.token"],
+          f"…with its certificate and its device token ({rec.get('cn')}, {rec.get('auth')})")
+    check(rec.get("ready"), "it connects its target only when told to start, and says ready")
+    check(rec.get("echo_ok"), f"200 kB go to the target and come back intact ({rec.get('exception', 'no error')})")
+    acks = rec.get("acks") or []
+    check(acks and acks == sorted(acks) and acks[-1] >= rec.get("payload_len", 0) - 32768,
+          f"it acknowledges what it wrote to the target ({len(acks)} acks, last {acks[-1] if acks else None})")
+
+    sid2 = str(uuid.uuid4())
+    gw3.push({"type": "console.open", "session": sid2, "target": "nosuch"})
+    wait_for(lambda: any(f.get("session") == sid2 for f in gw3.of_type("console.status")), 10,
+             "a target the device does not have is refused")
+    refusal = [f for f in gw3.of_type("console.status") if f.get("session") == sid2]
+    check(refusal and refusal[0].get("state") == "refused" and "target" in refusal[0].get("reason", ""),
+          f"…with a reason: {refusal[0].get('reason') if refusal else None}")
+    check(sid2 not in gw3.console, "…and no session socket is opened for it")
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=20)
+    check(proc.returncode == 0, "stops cleanly")
+
+    # A device with console off answers too, instead of leaving the operator waiting.
+    gw4 = Gateway(d)
+    write_config(d, gw4, ota, key, "2.0.0", updates=False)
+    proc = start_agent(args.agent, d, env, "agent-5.log")
+    wait_for(lambda: gw4.sessions >= 1 and any("fw" in f.get("state", {}) for f in gw4.of_type("twin.report")),
+             15, "session up, console off in the configuration")
+    sid3 = str(uuid.uuid4())
+    gw4.push({"type": "console.open", "session": sid3, "target": "echo"})
+    wait_for(lambda: any(f.get("session") == sid3 and f.get("state") == "refused" for f in gw4.of_type("console.status")),
+             10, "a device with console off refuses at once")
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=20)
+    check(proc.returncode == 0, "stops cleanly")
+
     if failures:
         print(f"\n{len(failures)} check(s) failed; agent logs are in {d}")
-        for name in ("agent-1.log", "agent-2.log", "agent-3.log"):
+        for name in ("agent-1.log", "agent-2.log", "agent-3.log", "agent-4.log", "agent-5.log"):
             path = f"{d}/{name}"
             if os.path.exists(path):
                 print(f"--- {name} (last lines)")

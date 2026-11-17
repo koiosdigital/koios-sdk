@@ -1,6 +1,7 @@
 #include "koios/cloudlink.h"
 #include "koios/ota.h"
 #include "koios/metrics.h"
+#include "koios/console.h"
 
 #include "koios/port/kp_os.h"
 #include "koios/port/kp_log.h"
@@ -626,6 +627,12 @@ static void handle_control_frame(const char* data, size_t len) {
         // over HTTPS (no-op if koios_ota_init was never called).
         KP_LOGI(TAG, "ota.offer received, triggering update check");
         koios_ota_check_now();
+    }
+    else if (strcmp(type, "console.open") == 0) {
+        // An operator asks for a console session. The console module takes
+        // or refuses it; either way it answers (it refuses when it was never
+        // started).
+        koios_console_on_open(root);
     }
     else if (strcmp(type, "cert.renew_required") == 0) {
         if (s.cfg.auth_mode != KOIOS_CLOUD_AUTH_MTLS || !s.cfg.on_cert_renew_csr) {

@@ -58,6 +58,7 @@ struct kp_ws {
     char* path;
     int port;
     char* bearer;
+    char* protocols;
     X509* cert;
     STACK_OF(X509)* chain;
     EVP_PKEY* pkey;
@@ -449,7 +450,8 @@ static bool http_upgrade(struct kp_ws* ws, kp_ws_disconnect_info_t* info) {
     char key[32];
     EVP_EncodeBlock((unsigned char*)key, nonce, sizeof(nonce));
 
-    const size_t req_cap = 512 + strlen(ws->host) + strlen(ws->path) + (ws->bearer ? strlen(ws->bearer) : 0);
+    const size_t req_cap = 512 + strlen(ws->host) + strlen(ws->path) +
+        (ws->bearer ? strlen(ws->bearer) : 0) + (ws->protocols ? strlen(ws->protocols) : 0);
     char* req = malloc(req_cap);
     if (!req) return false;
     const bool default_port = ws->port == (ws->tls ? 443 : 80);
@@ -466,6 +468,7 @@ static bool http_upgrade(struct kp_ws* ws, kp_ws_disconnect_info_t* info) {
         "User-Agent: koios-sdk-linux\r\n",
         ws->path, hostport, key);
     if (ws->bearer) n += snprintf(req + n, req_cap - (size_t)n, "Authorization: Bearer %s\r\n", ws->bearer);
+    if (ws->protocols) n += snprintf(req + n, req_cap - (size_t)n, "Sec-WebSocket-Protocol: %s\r\n", ws->protocols);
     n += snprintf(req + n, req_cap - (size_t)n, "\r\n");
 
     const int64_t deadline = kp_monotonic_us() + (int64_t)CONNECT_TIMEOUT_MS * 1000;
@@ -788,6 +791,7 @@ static void ws_free(struct kp_ws* ws) {
     free(ws->host);
     free(ws->path);
     free(ws->bearer);
+    free(ws->protocols);
     X509_free(ws->cert);
     sk_X509_pop_free(ws->chain, X509_free);
     EVP_PKEY_free(ws->pkey);
@@ -935,6 +939,10 @@ kp_ws_t kp_ws_open(const kp_ws_config_t* cfg) {
         ws->bearer = strdup(cfg->bearer);
         ok = ws->bearer != NULL;
     }
+    if (ok && cfg->protocols) {
+        ws->protocols = strdup(cfg->protocols);
+        ok = ws->protocols != NULL;
+    }
     if (ok && cfg->client_cert_pem) {
         const kp_linux_key_ctx_t* key = cfg->client_key_ctx;
         ok = key && key->pkey && load_client_chain(ws, cfg->client_cert_pem, cfg->client_cert_len);
@@ -977,7 +985,11 @@ bool kp_ws_send(kp_ws_t ws, const void* data, size_t len, bool binary, uint32_t 
 
 bool kp_ws_close_bounded(kp_ws_t ws, uint32_t timeout_ms) {
     if (!ws) return true;
-    // Mask events first: the core has dropped its handle.
+    // Say goodbye while the connection is still ours to write on: the peer
+    // then sees a close, not a broken connection. Everything sent before it is
+    // already in the socket and is delivered first.
+    if (atomic_load(&ws->connected)) send_frame(ws, 0x8, "\x03\xe8", 2, 1000);
+    // Mask events: the core has dropped its handle.
     atomic_store(&ws->closing, true);
     const char wake = 1;
     if (write(ws->wake_pipe[1], &wake, 1) < 0) { /* the pipe is full: the thread is awake */ }

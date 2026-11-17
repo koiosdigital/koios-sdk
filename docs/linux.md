@@ -41,6 +41,7 @@ the device key in a PKCS#11 token (SoftHSM behind OpenSSL's pkcs11 provider).
 | `kp_websocket` | a client written on OpenSSL (RFC 6455), one thread per connection |
 | `kp_ota` | downloads to a staging directory, checks size and SHA-256, runs the system's installer. Never writes a partition |
 | `kp_metrics` | `/proc` and `/sys` |
+| `kp_console` | the session's WebSocket joined to a local TCP address (`console_stream.c`) |
 
 Two things differ from an MCU on purpose:
 
@@ -172,6 +173,51 @@ The installer is where the image's signature is checked. The SHA-256 in an
 offer proves the download is what Koios meant to send, not that the image is
 one the device should run.
 
+## Console sessions
+
+An operator reaches the machine through the Koios gateway while the machine
+stays behind its outbound link. Off by default:
+
+```ini
+[console]
+enabled = yes
+target.ssh = 127.0.0.1:22
+```
+
+A target is a name and a local TCP address. The gateway asks for a target by
+name (`console.open` on cloudlink); the agent joins a session only to an
+address this file lists, and refuses anything else at once
+(`console.status`). The cloud never names an address.
+
+For each session the agent opens a second WebSocket, to the gateway it is
+already connected to and nowhere else
+(`<cloud url>/v1/console/sessions/<id>/device`), with its device token and, on
+an mTLS gateway, its certificate. It connects the target only when the gateway
+says the operator is there. With `target.ssh` pointing at the machine's own
+sshd, the stream is SSH between the operator's client and that sshd: the
+gateway relays bytes it cannot read, and whether anyone gets a shell is still
+decided by sshd alone.
+
+Three switches have to be on for a session to exist: the operator's
+`iot.console` permission, the `console` capability on the device's fleet, and
+this section. At most 4 sessions run at a time.
+
+### `koios-console`, the operator's end
+
+```sh
+ssh -o ProxyCommand='koios-console attach <operator-url> <ticket>' user@device
+```
+
+`koios-console attach` joins the session to stdin and stdout. The URL and the
+ticket come from the Koios console (device page, Console tab, New session);
+the ticket works once and for a few minutes, and may be given in
+`KOIOS_CONSOLE_TICKET` instead of on the command line. It builds from the same
+tree (`-DKOIOS_BUILD_TOOLS=ON`, the default) on Linux and macOS.
+
+The two ends do flow control between themselves (`console_stream.h`): an end
+sends at most 256 KiB beyond what the other has acknowledged writing out, so
+the relay never holds more than that, however large the copy.
+
 ## Tests
 
 | Test | What it proves |
@@ -180,4 +226,8 @@ one the device should run.
 | `logstore_*` | ring order, eviction, consume after an eviction, survival across two processes |
 | `metrics` | the `/proc` and `/sys` parsers against fixtures |
 | `websocket` | framing both ways against a scripted server (three length forms, fragments, a ping between fragments, bytes one at a time, the size bound), and how each kind of failure is classified |
-| `agent_e2e` | the agent binary against a mock gateway with mutual TLS and a mock OTA service: gate on the provisioned marker, a three-level chain completed from `extra_chain`, twin reports, the metrics interval from the desired twin, log shipping, an update through a fake installer with a resumed download, confirmation after the restart, reconnect after the gateway closes the session |
+| `agent_e2e` | the agent binary against a mock gateway with mutual TLS and a mock OTA service: gate on the provisioned marker, a three-level chain completed from `extra_chain`, twin reports, the metrics interval from the desired twin, log shipping, an update through a fake installer with a resumed download, confirmation after the restart, reconnect after the gateway closes the session, and console sessions (the session socket with certificate and token, a target connected only on `start`, 200 kB to an echo target and back, acknowledgements, refusal of an unknown target and of everything when console is off) |
+
+The console was also run for real against the gateway's own code (`koios-sh-vn`
+and `koios-sh-iot-api` under `wrangler dev`): `ssh` through `koios-console`,
+the relay and the agent to an sshd, 40 MB each way with checksums.

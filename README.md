@@ -11,6 +11,8 @@ include/koios/          public API
   ota.h                   update-check protocol + scheduling
   logship.h               log shipping
   metrics.h               device metrics
+  console.h               console sessions (an operator reaches the device
+                          through the gateway)
   port/                   the port contracts (kp_*)
 core/                   portable core — no platform includes (cJSON only)
 ports/esp-idf/          ESP-IDF port, layered on kd_common
@@ -37,6 +39,7 @@ identity, RTOS primitives.
 | `kp_ota` | download/verify/flash an image + pending-update record | esp_https_ota (streamed sha256) + NVS |
 | `kp_logstore` | reset-surviving leveled-log capture + ring | esp_log_set_vprintf hook + RTC_NOINIT ring |
 | `kp_metrics` | one sample of the system's vital signs | heap, tasks, uptime, RSSI, reset reason; CPU with run-time stats |
+| `kp_console` | carry one console session | not implemented: an ESP-IDF device refuses every session |
 
 The Linux implementations are listed in [docs/linux.md](docs/linux.md).
 
@@ -146,6 +149,20 @@ platform's default set.
 **Opt-in and off by default** on ESP-IDF, gated by
 `CONFIG_KOIOS_SDK_METRICS_ENABLE`; when disabled `koios_metrics_init()` is a
 no-op and nothing is added.
+
+## Console sessions
+
+An operator can reach a device through the gateway while the device stays
+behind its outbound link (`include/koios/console.h`). The gateway asks with a
+`console.open` control frame naming a **target**; the device joins the session
+only to a target its own configuration lists, over a second WebSocket it opens
+for that session to the gateway it is already connected to. On Linux a target
+is a local TCP address, typically the machine's own sshd, so the session is
+SSH end to end and the gateway relays bytes it cannot read
+([docs/linux.md](docs/linux.md)).
+
+The ESP-IDF port has no console yet. A device without it answers
+`console.status` `refused` at once, so an operator is told instead of waiting.
 
 ## Porting
 

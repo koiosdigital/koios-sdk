@@ -18,6 +18,7 @@ if(COMMAND idf_component_register)
             "core/ota.c"
             "core/logship.c"
             "core/metrics.c"
+            "core/console.c"
             "ports/esp-idf/kp_os_esp.c"
             "ports/esp-idf/kp_log_esp.c"
             "ports/esp-idf/kp_logstore_esp.c"

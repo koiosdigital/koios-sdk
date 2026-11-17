@@ -15,6 +15,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 
 option(KOIOS_BUILD_AGENT "Build the koios-agent daemon" ON)
+option(KOIOS_BUILD_TOOLS "Build koios-console, the operator's end of a console session" ON)
 option(KOIOS_BUILD_TESTS "Build the tests" ON)
 set(KOIOS_CJSON_DIR "" CACHE PATH "Directory with cJSON.c and cJSON.h (empty: use the system's libcjson)")
 
@@ -29,6 +30,7 @@ add_library(koios_sdk STATIC
     ${SDK_ROOT}/core/ota.c
     ${SDK_ROOT}/core/logship.c
     ${SDK_ROOT}/core/metrics.c
+    ${SDK_ROOT}/core/console.c
     kp_os_linux.c
     kp_log_linux.c
     kp_logstore_linux.c
@@ -38,6 +40,8 @@ add_library(koios_sdk STATIC
     kp_websocket_linux.c
     kp_ota_linux.c
     kp_metrics_linux.c
+    kp_console_linux.c
+    console_stream.c
 )
 
 # cJSON: the core includes <cJSON.h>.
@@ -66,6 +70,7 @@ target_compile_definitions(koios_sdk PUBLIC
     CONFIG_KOIOS_SDK_LOGS_BODY_BYTES=32768
     CONFIG_KOIOS_SDK_METRICS_ENABLE=1
     CONFIG_KOIOS_SDK_METRICS_BACKLOG=30
+    CONFIG_KOIOS_SDK_CONSOLE_ENABLE=1
 )
 if(NOT APPLE)
     target_compile_definitions(koios_sdk PRIVATE _GNU_SOURCE)
@@ -88,6 +93,17 @@ if(KOIOS_BUILD_AGENT)
 
     include(GNUInstallDirs)
     install(TARGETS koios-agent RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR})
+endif()
+
+if(KOIOS_BUILD_TOOLS)
+    add_executable(koios-console tools/koios-console.c)
+    if(NOT APPLE)
+        target_compile_definitions(koios-console PRIVATE _GNU_SOURCE)
+    endif()
+    target_compile_options(koios-console PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(koios-console PRIVATE koios_sdk)
+    include(GNUInstallDirs)
+    install(TARGETS koios-console RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 if(KOIOS_BUILD_TESTS)

@@ -58,6 +58,11 @@ typedef struct {
     // (API-key auth). NULL for none.
     const char* bearer;
 
+    // Subprotocols offered on the handshake (the value of the
+    // Sec-WebSocket-Protocol header, comma-separated). NULL for none. Only
+    // ports that serve console sessions need to honour it.
+    const char* protocols;
+
     size_t max_rx_size;  // messages larger than this are dropped
 
     kp_ws_event_fn on_event;
